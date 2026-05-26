@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "647657035938",
+    "project_id": "almacen-remates",
+    "storage_bucket": "almacen-remates.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:647657035938:android:185c29875fa7e6afd99ffb",
+        "android_client_info": {
+          "package_name": "com.example.trabajador_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCayjauoc4v5JtFY9So5igTZhlyy0TBmzw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
