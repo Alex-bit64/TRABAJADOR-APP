@@ -10,7 +10,7 @@
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 
 	<key>CFBundleDisplayName</key>
-	<string>Trabajador App</string>
+	<string>Marcador de Asistencias</string>
 
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
@@ -22,7 +22,7 @@
 	<string>6.0</string>
 
 	<key>CFBundleName</key>
-	<string>trabajador_app</string>
+	<string>Marcador de Asistencias</string>
 
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
@@ -91,6 +91,9 @@
 
 	<key>NSCameraUsageDescription</key>
 	<string>Necesario para escanear el código QR de asistencia</string>
+
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Necesario para validar tu ubicacion al registrar asistencia</string>
 
 	<key>NSFaceIDUsageDescription</key>
 	<string>Necesario para verificar tu identidad</string>

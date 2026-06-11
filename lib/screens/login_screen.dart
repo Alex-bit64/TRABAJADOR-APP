@@ -1,13 +1,21 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
-import '../services/firestore_service.dart';
-import '../services/biometric_store.dart';
-import 'biometric_screen.dart';
-import 'home_screen.dart';
+import '../services/app_logger.dart';
+import '../services/session_service.dart';
+import '../services/supabase_service.dart';
+import '../theme/app_theme.dart';
+import 'app_requirements_screen.dart';
 
 class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
+  final ThemeMode themeMode;
+  final VoidCallback onThemeToggle;
+
+  const LoginScreen({
+    super.key,
+    required this.themeMode,
+    required this.onThemeToggle,
+  });
 
   @override
   State<LoginScreen> createState() => _LoginScreenState();
@@ -18,144 +26,108 @@ class _LoginScreenState extends State<LoginScreen> {
   final _passwordController = TextEditingController();
   bool _mostrarPassword = false;
   bool _cargando = false;
-  final _biometricStore = BiometricStore();
-  bool _tryingBiometric = false;
+  bool _assetsPrecargados = false;
 
   @override
   void initState() {
     super.initState();
-    Future.microtask(_tryBiometricAutoLogin);
+    _restaurarSesionGuardada();
   }
 
-  Future<void> _tryBiometricAutoLogin() async {
-    if (_tryingBiometric) return;
-    _tryingBiometric = true;
-    try {
-      final keys = await _biometricStore.getSavedProfilesKeys();
-      if (keys.isEmpty) return;
-
-      final profile = await _biometricStore.readProfileWithBiometrics(
-        keys.first,
-        reason: 'Inicia sesión con tu huella',
-      );
-
-      if (profile == null) return;
-
-      final correo = profile['correo'] ?? '';
-      final password = profile['password'] ?? '';
-      if (correo.isEmpty || password.isEmpty) return;
-
-      _emailController.text = correo;
-      _passwordController.text = password;
-      await _continuar();
-    } finally {
-      _tryingBiometric = false;
+  Future<void> _restaurarSesionGuardada() async {
+    final usuario = await SessionService().obtenerUsuario();
+    if (!mounted) {
+      return;
     }
+
+    if (usuario == null) {
+      return;
+    }
+
+    AppLogger.info('Login', 'Sesion guardada restaurada', {
+      'dni': AppLogger.shortId(usuario['dni']?.toString() ?? ''),
+    });
+
+    _abrirRequisitos(usuario);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_assetsPrecargados) {
+      return;
+    }
+    _assetsPrecargados = true;
+    precacheImage(const AssetImage('assets/fondo1.png'), context);
+    precacheImage(const AssetImage('assets/fondo2.png'), context);
+    precacheImage(const AssetImage('assets/logo.png'), context);
+  }
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    _passwordController.dispose();
+    super.dispose();
   }
 
   Future<void> _continuar() async {
-    final correo = _emailController.text.trim();
+    final identificador = _normalizarIdentificador(_emailController.text);
     final password = _passwordController.text.trim();
 
-    if (correo.isEmpty || password.isEmpty) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Completa correo y contraseña para continuar.'),
-            backgroundColor: Color(0xFFE63232),
-          ),
-        );
-      }
+    AppLogger.info('Login', 'Intento de login iniciado', {
+      'identificador': identificador.isEmpty
+          ? 'vacio'
+          : _maskIdentificador(identificador),
+    });
+
+    if (identificador.isEmpty || password.isEmpty) {
+      AppLogger.warning('Login', 'Login cancelado por campos vacios', {
+        'identificador_vacio': identificador.isEmpty,
+        'password_vacio': password.isEmpty,
+      });
+      _mostrarError('Completa usuario y contrasena para continuar.');
       return;
     }
 
     setState(() => _cargando = true);
 
     try {
-      final svc = FirestoreService();
-      final usuario = await svc.buscarUsuarioPorCredenciales(correo, password);
-
-      if (usuario == null) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text(
-                'Usuario no encontrado. Contacta al administrador.',
-              ),
-              backgroundColor: Color(0xFFE63232),
-            ),
-          );
-        }
-        return;
-      }
+      final usuario = await SupabaseService().buscarUsuarioPorCredenciales(
+        identificador,
+        password,
+      );
 
       if (!mounted) {
         return;
       }
 
-      final biometriaRegistrada =
-          usuario['biometria_registrada'] == true ||
-          usuario['registro_huella'] == true;
-
-      if (biometriaRegistrada) {
-        final autenticado = await svc.verificarBiometriaLogin(usuario);
-        if (!mounted) {
-          return;
-        }
-
-        if (!autenticado) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('Huella no verificada.'),
-                backgroundColor: Color(0xFFE63232),
-              ),
-            );
-          }
-          return;
-        }
-      } else {
-        // Si no tiene biometría registrada, pedir registro en la pantalla de biometría.
-        if (mounted) {
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(
-              builder: (_) => BiometricScreen(usuario: usuario),
-            ),
-          );
-        }
+      if (usuario == null) {
+        AppLogger.warning('Login', 'Credenciales rechazadas', {
+          'identificador': _maskIdentificador(identificador),
+        });
+        _mostrarError('Credenciales no validas. Verifica tus datos.');
         return;
       }
-      // Guardar perfil localmente cifrado para futuros inicios por huella
-      try {
-        if (await _biometricStore.canCheckBiometrics()) {
-          final idTrab = usuario['id_trabajador']?.toString() ?? '';
-          if (idTrab.isNotEmpty) {
-            await _biometricStore.saveProfile(
-              idTrabajador: idTrab,
-              correo: correo,
-              password: password,
-            );
-          }
-        }
-      } catch (_) {
-        // Silenciar errores de almacenamiento local
+
+      AppLogger.info('Login', 'Login exitoso', {
+        'dni': AppLogger.shortId(usuario['dni']?.toString() ?? ''),
+        'id_tienda': AppLogger.shortId(usuario['id_tienda']?.toString() ?? ''),
+      });
+
+      await SessionService().guardarUsuario(usuario);
+
+      if (!mounted) {
+        return;
       }
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (_) => HomeScreen(usuario: usuario)),
-      );
+
+      _abrirRequisitos(usuario);
     } catch (e, st) {
-      debugPrint('LoginScreen._continuar error: $e');
-      debugPrint('$st');
+      AppLogger.error('Login', 'Error durante login', e, st, {
+        'identificador': _maskIdentificador(identificador),
+      });
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'No se pudo iniciar sesión. Revisa tu conexión e intenta de nuevo.',
-            ),
-            backgroundColor: Color(0xFFE63232),
-          ),
+        _mostrarError(
+          'No se pudo iniciar sesion. Revisa tu conexion e intenta de nuevo.',
         );
       }
     } finally {
@@ -165,159 +137,335 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
+  void _mostrarError(String mensaje) {
+    if (!mounted) {
+      return;
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(mensaje), backgroundColor: AppPalette.error),
+    );
+  }
+
+  void _abrirRequisitos(Map<String, dynamic> usuario) {
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => AppRequirementsScreen(
+          usuario: usuario,
+          themeMode: widget.themeMode,
+          onThemeToggle: widget.onThemeToggle,
+        ),
+      ),
+    );
+  }
+
+  String _maskIdentificador(String identificador) {
+    if (identificador.contains('@')) {
+      return AppLogger.maskEmail(identificador);
+    }
+    return AppLogger.shortId(identificador);
+  }
+
+  String _normalizarIdentificador(String value) {
+    final limpio = value.trim();
+    if (limpio.contains('@')) {
+      return limpio.toLowerCase();
+    }
+    return limpio;
+  }
+
+  void _normalizarCorreoEnCampo(String value) {
+    if (!value.contains('@')) {
+      return;
+    }
+
+    final lower = value.toLowerCase();
+    if (lower == value) {
+      return;
+    }
+
+    final seleccion = _emailController.selection;
+    _emailController.value = TextEditingValue(
+      text: lower,
+      selection: seleccion.copyWith(
+        baseOffset: seleccion.baseOffset.clamp(0, lower.length),
+        extentOffset: seleccion.extentOffset.clamp(0, lower.length),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
+
     return Scaffold(
-      resizeToAvoidBottomInset: true,
+      resizeToAvoidBottomInset: false,
       body: Stack(
         children: [
-          Image.asset(
-            'assets/fondo.png',
-            fit: BoxFit.cover,
-            width: double.infinity,
-            height: double.infinity,
+          RepaintBoundary(
+            child: Image.asset(
+              AppTheme.backgroundFor(context),
+              fit: BoxFit.cover,
+              width: double.infinity,
+              height: double.infinity,
+              filterQuality: FilterQuality.low,
+              gaplessPlayback: true,
+            ),
           ),
-          SafeArea(
-            child: SingleChildScrollView(
-              physics: const BouncingScrollPhysics(),
-              padding: EdgeInsets.fromLTRB(
-                28,
-                24,
-                28,
-                MediaQuery.of(context).viewInsets.bottom + 24,
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  const SizedBox(height: 40),
-                  Text(
-                    'ALMACEN\nDE REMATES',
-                    textAlign: TextAlign.center,
-                    style: GoogleFonts.bebasNeue(
-                      fontSize: 42,
-                      color: Colors.white,
-                      letterSpacing: 3,
-                      height: 1.1,
-                    ),
-                  ),
-                  const SizedBox(height: 36),
-                  Text(
-                    'Correo',
-                    style: GoogleFonts.robotoCondensed(
-                      fontSize: 14,
-                      color: Colors.white,
-                      fontWeight: FontWeight.w700,
-                      letterSpacing: 1.5,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  TextField(
-                    controller: _emailController,
-                    keyboardType: TextInputType.emailAddress,
-                    cursorColor: Colors.white,
-                    style: const TextStyle(color: Colors.white, fontSize: 16),
-                    decoration: InputDecoration(
-                      filled: true,
-                      fillColor: Colors.black,
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(10),
-                        borderSide: BorderSide(color: Colors.white24),
-                      ),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(10),
-                        borderSide: BorderSide(color: Colors.white54),
-                      ),
-                      hintText: 'correo@ejemplo.com',
-                      hintStyle: TextStyle(color: Colors.white54),
-                      contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 14,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    'Contrasena',
-                    style: GoogleFonts.robotoCondensed(
-                      fontSize: 14,
-                      color: Colors.white,
-                      fontWeight: FontWeight.w700,
-                      letterSpacing: 1.5,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  TextField(
-                    controller: _passwordController,
-                    obscureText: !_mostrarPassword,
-                    cursorColor: Colors.white,
-                    style: const TextStyle(color: Colors.white, fontSize: 16),
-                    decoration: InputDecoration(
-                      filled: true,
-                      fillColor: Colors.black,
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(10),
-                        borderSide: BorderSide(color: Colors.white24),
-                      ),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(10),
-                        borderSide: BorderSide(color: Colors.white54),
-                      ),
-                      hintText: 'Contrasena',
-                      hintStyle: TextStyle(color: Colors.white54),
-                      contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 14,
-                      ),
-                      suffixIcon: IconButton(
-                        icon: Icon(
-                          _mostrarPassword
-                              ? Icons.visibility_off
-                              : Icons.visibility,
-                          color: Colors.white70,
-                        ),
-                        onPressed: () {
-                          setState(() => _mostrarPassword = !_mostrarPassword);
-                        },
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 18),
-                  GestureDetector(
-                    onTap: _cargando ? null : _continuar,
-                    child: Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFE63232),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Center(
-                        child: _cargando
-                            ? const SizedBox(
-                                width: 20,
-                                height: 20,
-                                child: CircularProgressIndicator(
-                                  color: Colors.white,
-                                  strokeWidth: 2,
-                                ),
-                              )
-                            : Text(
-                                'Entrar',
-                                style: GoogleFonts.bebasNeue(
-                                  fontSize: 18,
-                                  color: Colors.white,
-                                  letterSpacing: 1,
-                                ),
-                              ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 30),
-                ],
+          Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: isDark
+                    ? [
+                        Colors.black.withValues(alpha: 0.40),
+                        Colors.black.withValues(alpha: 0.62),
+                      ]
+                    : [
+                        Colors.white.withValues(alpha: 0.10),
+                        Colors.white.withValues(alpha: 0.18),
+                      ],
               ),
             ),
           ),
+          SafeArea(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final availableHeight =
+                    constraints.maxHeight -
+                    MediaQuery.of(context).viewInsets.bottom;
+
+                return SingleChildScrollView(
+                  physics: const BouncingScrollPhysics(),
+                  padding: EdgeInsets.fromLTRB(
+                    28,
+                    18,
+                    28,
+                    MediaQuery.of(context).viewInsets.bottom + 24,
+                  ),
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(minHeight: availableHeight),
+                    child: Center(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 420),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Align(
+                              alignment: Alignment.centerRight,
+                              child: IconButton(
+                                tooltip: isDark ? 'Modo claro' : 'Modo oscuro',
+                                onPressed: widget.onThemeToggle,
+                                icon: Icon(
+                                  isDark ? Icons.light_mode : Icons.dark_mode,
+                                ),
+                                style: IconButton.styleFrom(
+                                  foregroundColor: AppPalette.turquesaBrillante,
+                                  backgroundColor: Colors.white.withValues(
+                                    alpha: 0.12,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 18),
+                            Container(
+                              padding: const EdgeInsets.all(28),
+                              decoration: BoxDecoration(
+                                color: isDark
+                                    ? Colors.black.withValues(alpha: 0.42)
+                                    : const Color(
+                                        0xFFFAF3E9,
+                                      ).withValues(alpha: 0.96),
+                                borderRadius: BorderRadius.circular(24),
+                                border: Border.all(
+                                  color: isDark
+                                      ? AppPalette.turquesaBrillante.withValues(
+                                          alpha: 0.22,
+                                        )
+                                      : Colors.black12,
+                                ),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: isDark
+                                        ? Colors.black.withValues(alpha: 0.35)
+                                        : Colors.black.withValues(alpha: 0.12),
+                                    blurRadius: 28,
+                                    offset: const Offset(0, 14),
+                                  ),
+                                ],
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  Text(
+                                    'REGISTRO',
+                                    textAlign: TextAlign.center,
+                                    style: GoogleFonts.bebasNeue(
+                                      fontSize: 38,
+                                      color: isDark
+                                          ? Colors.white
+                                          : AppPalette.azulOscuro,
+                                      letterSpacing: 3.5,
+                                      height: 1.0,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 24),
+                                  const _EtiquetaCampo(texto: 'Correo'),
+                                  const SizedBox(height: 8),
+                                  TextField(
+                                    controller: _emailController,
+                                    keyboardType: TextInputType.emailAddress,
+                                    textInputAction: TextInputAction.next,
+                                    textCapitalization: TextCapitalization.none,
+                                    autocorrect: false,
+                                    enableSuggestions: false,
+                                    onChanged: _normalizarCorreoEnCampo,
+                                    cursorColor: scheme.primary,
+                                    style: TextStyle(
+                                      color: isDark
+                                          ? Colors.white.withValues(alpha: 0.95)
+                                          : Colors.black87,
+                                      fontSize: 16,
+                                    ),
+                                    decoration: _inputDecoration(''),
+                                  ),
+                                  const SizedBox(height: 16),
+                                  const _EtiquetaCampo(texto: 'Contraseña'),
+                                  const SizedBox(height: 8),
+                                  TextField(
+                                    controller: _passwordController,
+                                    obscureText: !_mostrarPassword,
+                                    textInputAction: TextInputAction.done,
+                                    autocorrect: false,
+                                    enableSuggestions: false,
+                                    onSubmitted: (_) =>
+                                        _cargando ? null : _continuar(),
+                                    cursorColor: scheme.primary,
+                                    style: TextStyle(
+                                      color: isDark
+                                          ? Colors.white.withValues(alpha: 0.95)
+                                          : Colors.black87,
+                                      fontSize: 16,
+                                    ),
+                                    decoration: _inputDecoration('').copyWith(
+                                      suffixIcon: IconButton(
+                                        icon: Icon(
+                                          _mostrarPassword
+                                              ? Icons.visibility_off
+                                              : Icons.visibility,
+                                          color: isDark
+                                              ? AppPalette.verdeAzulado
+                                              : AppPalette.azulOscuro,
+                                        ),
+                                        onPressed: () {
+                                          setState(
+                                            () => _mostrarPassword =
+                                                !_mostrarPassword,
+                                          );
+                                        },
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(height: 26),
+                                  ElevatedButton(
+                                    onPressed: _cargando ? null : _continuar,
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor:
+                                          AppPalette.turquesaBrillante,
+                                      foregroundColor: Colors.white,
+                                      minimumSize: const Size.fromHeight(54),
+                                      shape: RoundedRectangleBorder(
+                                        borderRadius: BorderRadius.circular(14),
+                                      ),
+                                      elevation: 0,
+                                    ),
+                                    child: _cargando
+                                        ? const SizedBox(
+                                            width: 20,
+                                            height: 20,
+                                            child: CircularProgressIndicator(
+                                              color: Colors.white,
+                                              strokeWidth: 2,
+                                            ),
+                                          )
+                                        : Text(
+                                            'ENTRAR',
+                                            style: GoogleFonts.bebasNeue(
+                                              fontSize: 18,
+                                              color: Colors.white,
+                                              letterSpacing: 1.5,
+                                            ),
+                                          ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(height: 24),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
         ],
+      ),
+    );
+  }
+
+  InputDecoration _inputDecoration(String hint) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
+
+    return InputDecoration(
+      filled: true,
+      fillColor: isDark
+          ? Colors.black.withValues(alpha: 0.28)
+          : const Color(0xFFFAF3E9).withValues(alpha: 0.96),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(8),
+        borderSide: BorderSide(
+          color: isDark ? AppTheme.glassBorder(context) : Colors.black12,
+        ),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(8),
+        borderSide: BorderSide(color: scheme.primary, width: 2),
+      ),
+      hintText: hint,
+      hintStyle: TextStyle(color: isDark ? Colors.white70 : Colors.black45),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+    );
+  }
+}
+
+class _EtiquetaCampo extends StatelessWidget {
+  final String texto;
+
+  const _EtiquetaCampo({required this.texto});
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return Text(
+      texto,
+      style: GoogleFonts.robotoCondensed(
+        fontSize: 14,
+        color: isDark ? Colors.white70 : Colors.black87,
+        fontWeight: FontWeight.w700,
+        letterSpacing: 1.5,
       ),
     );
   }

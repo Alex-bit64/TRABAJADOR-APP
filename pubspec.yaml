@@ -31,29 +31,20 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # Firebase
-  firebase_core: ^3.6.0
-  firebase_auth: ^5.3.0
-  cloud_firestore: ^5.4.0
+  # Supabase
+  supabase_flutter: ^2.5.0
 
   # QR Scanner
   mobile_scanner: ^5.2.3
 
-  # Biometría
-  local_auth: ^2.3.0
-
-  # Secure storage for encrypted credentials
-  flutter_secure_storage: ^8.0.0
-
-  # Dispositivo
-  device_info_plus: ^10.1.0
-
   # GPS
   geolocator: ^13.0.1
+  permission_handler: ^11.3.1
 
   # UI
   google_fonts: ^6.2.1
   intl: ^0.19.0
+  shared_preferences: ^2.3.2
 
   cupertino_icons: ^1.0.8
 
@@ -67,4 +58,7 @@ flutter:
   uses-material-design: true
 
   assets:
-    - assets/fondo.png
+    - assets/fondo1.png
+    - assets/fondo2.png
+    - assets/logo.png
+    - assets/launch_logo.png
