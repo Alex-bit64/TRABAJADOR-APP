@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 import '../services/app_requirements_service.dart';
+import '../theme/app_google_fonts.dart';
 import '../theme/app_theme.dart';
 import 'home_screen.dart';
 
@@ -146,7 +146,7 @@ class _AppRequirementsScreenState extends State<AppRequirementsScreen>
                         ),
                         const SizedBox(height: 8),
                         Text(
-                          'Antes de entrar al menu principal necesitamos internet, GPS y camara activos.',
+                          'GPS y camara son obligatorios. Sin internet puedes usar datos guardados y dejar marcas pendientes de sincronizar.',
                           textAlign: TextAlign.center,
                           style: GoogleFonts.robotoCondensed(
                             fontSize: 14,

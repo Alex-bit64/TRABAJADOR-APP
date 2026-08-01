@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
+
+import 'app_google_fonts.dart';
 
 class AppPalette {
   static const azulOscuro = Color(0xFF1E3A8A);

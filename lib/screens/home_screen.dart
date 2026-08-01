@@ -1,17 +1,26 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:uuid/uuid.dart';
 
+import '../services/app_requirements_service.dart';
 import '../services/app_logger.dart';
+import '../services/device_security_service.dart';
+import '../services/local_database_service.dart';
 import '../services/qr_service.dart';
 import '../services/session_service.dart';
 import '../services/supabase_service.dart';
+import '../services/top_message_service.dart';
+import '../theme/app_google_fonts.dart';
 import '../theme/app_theme.dart';
+import 'app_requirements_screen.dart';
 import 'login_screen.dart';
+
+enum _ModoRegistro { asistencia, tracking }
 
 class HomeScreen extends StatefulWidget {
   final Map<String, dynamic> usuario;
@@ -31,12 +40,18 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   static const _platform = MethodChannel('trabajador_app/platform');
 
   final _supabaseService = SupabaseService();
   final _qrService = QRService();
+  final _requirementsService = AppRequirementsService();
+  final _localDatabase = LocalDatabaseService.instance;
+  final _deviceSecurity = DeviceSecurityService();
   static const Duration _cooldownMarcacion = Duration(minutes: 10);
+  static const Duration _toleranciaFusionMarcacionNormal = Duration(
+    minutes: 15,
+  );
   static const String _origenHorarioManual = 'manual_sin_horario';
   static const Map<String, Map<String, dynamic>> _horariosPorJornada = {
     'fulltime': {
@@ -63,15 +78,29 @@ class _HomeScreenState extends State<HomeScreen> {
   Map<String, dynamic>? _horarioHoy;
   List<Map<String, dynamic>> _historialActual = [];
   List<Map<String, dynamic>> _historialAnterior = [];
+  List<Map<String, dynamic>> _trackingHoy = [];
+  List<Map<String, dynamic>> _trackingActual = [];
+  List<Map<String, dynamic>> _trackingAnterior = [];
   bool _escaneando = false;
   bool _procesando = false;
   bool _qrProcesado = false;
   bool _enCooldown = false;
+  bool _sincronizandoTracking = false;
+  bool _sincronizandoPendientes = false;
+  bool _hayInternet = true;
+  int _cantidadPendientes = 0;
+  Set<String> _marcasPendientesHoy = <String>{};
+  final Set<String> _marcasVisualesProtegidas = <String>{};
+  Map<String, Set<String>> _marcasPendientesPorFecha = {};
   Duration _cooldownRestante = Duration.zero;
   Timer? _cooldownTimer;
+  Timer? _requirementsTimer;
   int _mesSeleccionado = 0;
   int? _diaSeleccionado;
   bool _selectorJornadaAbierto = false;
+  bool _verificandoRequisitosContinuos = false;
+  bool _redirigiendoRequisitos = false;
+  _ModoRegistro _modoRegistro = _ModoRegistro.asistencia;
 
   static const _ordenMarcaciones = [
     ('Entrada', 'horario_entrada'),
@@ -88,6 +117,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     AppLogger.info('Home', 'Home iniciado', {
       'dni': AppLogger.shortId(_dni),
       'id_tienda': AppLogger.shortId(
@@ -96,6 +126,7 @@ class _HomeScreenState extends State<HomeScreen> {
       'scanner_auto': widget.abrirScannerAutomatico,
     });
     _cargarDatos();
+    _iniciarMonitorRequisitos();
     if (widget.abrirScannerAutomatico) {
       Future.delayed(const Duration(milliseconds: 500), () {
         if (mounted) {
@@ -107,8 +138,66 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _cooldownTimer?.cancel();
+    _requirementsTimer?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _verificarRequisitosContinuos();
+    }
+  }
+
+  void _iniciarMonitorRequisitos() {
+    _requirementsTimer?.cancel();
+    _requirementsTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      _verificarRequisitosContinuos();
+    });
+
+    Future.delayed(const Duration(milliseconds: 700), () {
+      if (mounted) {
+        _verificarRequisitosContinuos();
+      }
+    });
+  }
+
+  Future<void> _verificarRequisitosContinuos() async {
+    if (_verificandoRequisitosContinuos ||
+        _redirigiendoRequisitos ||
+        !mounted) {
+      return;
+    }
+
+    _verificandoRequisitosContinuos = true;
+    try {
+      final requisitos = await _requirementsService.check();
+      if (!mounted) {
+        return;
+      }
+      if (_hayInternet != requisitos.hasInternet) {
+        setState(() => _hayInternet = requisitos.hasInternet);
+      }
+      if (requisitos.hasInternet) {
+        unawaited(_sincronizarMarcacionesPendientes());
+      }
+      if (requisitos.ready) {
+        return;
+      }
+
+      AppLogger.warning('Home', 'Requisitos desactivados durante uso', {
+        'dni': AppLogger.shortId(_dni),
+      });
+      _mostrarMensaje(
+        'Requisitos incompletos. Activa internet, ubicacion y camara.',
+        esError: true,
+      );
+      _abrirFlujoRequisitos(abrirScannerAutomatico: false);
+    } finally {
+      _verificandoRequisitosContinuos = false;
+    }
   }
 
   Future<void> _cargarDatos() async {
@@ -116,11 +205,18 @@ class _HomeScreenState extends State<HomeScreen> {
       'dni': AppLogger.shortId(_dni),
     });
 
+    await _cargarPendientes();
     await Future.wait([
       _cargarAsistencia(),
       _cargarHorario(),
       _cargarHistorial(),
+      _cargarTracking(),
     ]);
+
+    await _sincronizarAsistenciaConTracking();
+    if (_hayInternet) {
+      await _sincronizarMarcacionesPendientes();
+    }
 
     AppLogger.info('Home', 'Carga de datos finalizada', {
       'dni': AppLogger.shortId(_dni),
@@ -135,7 +231,21 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    final data = await _supabaseService.obtenerAsistenciaHoy(_dni);
+    final local = await _localDatabase.obtenerAsistencia(_dni, DateTime.now());
+    if (mounted && local != null && _asistenciaHoy == null) {
+      setState(() => _asistenciaHoy = local);
+      _actualizarCooldownDesdeAsistencia(local);
+    }
+
+    final remoto = await _supabaseService.obtenerAsistenciaHoy(_dni);
+    final data = _combinarAsistenciaVisible(
+      remoto: remoto,
+      local: local,
+      actual: _asistenciaHoy,
+    );
+    if (data != null) {
+      await _localDatabase.guardarAsistencia(data);
+    }
     AppLogger.info('Home', 'Asistencia cargada', {
       'dni': AppLogger.shortId(_dni),
       'existe': data != null,
@@ -162,23 +272,46 @@ class _HomeScreenState extends State<HomeScreen> {
       'domingo',
     ];
     final diaHoy = diasSemana[DateTime.now().weekday - 1];
-    final horario = await _supabaseService.obtenerHorarioTrabajador(
+    final ahora = DateTime.now();
+    final horarioRemoto = await _supabaseService.obtenerHorarioTrabajador(
       _dni,
       diaSemana: diaHoy,
     );
+    if (horarioRemoto != null) {
+      await SessionService().guardarHorarioDia(_dni, ahora, horarioRemoto);
+    }
+    final horarioGuardado = horarioRemoto == null
+        ? await SessionService().obtenerHorarioDia(_dni, ahora)
+        : null;
+    final horarioAsignado = horarioRemoto ?? horarioGuardado;
+    final horarioManual = horarioAsignado == null
+        ? await SessionService().obtenerHorarioManual(_dni, ahora)
+        : null;
+    final horarioVisible = horarioAsignado ?? horarioManual;
 
     AppLogger.info('Home', 'Horario cargado', {
       'dni': AppLogger.shortId(_dni),
       'dia': diaHoy,
-      'existe': horario != null,
+      'existe': horarioVisible != null,
+      'cache': horarioRemoto == null && horarioGuardado != null,
     });
     if (mounted) {
-      setState(() => _horarioHoy = horario);
+      setState(() => _horarioHoy = horarioVisible);
     }
   }
 
   Future<void> _verificarHorarioDelDia() async {
-    if (!mounted || _dni.isEmpty || _horarioHoy != null) {
+    if (!mounted || _dni.isEmpty) {
+      return;
+    }
+
+    if (_horarioManualActivo && _horarioHoy != null) {
+      await _aplicarJornadaManualSegura(_horarioHoy!);
+      await Future.wait([_cargarAsistencia(), _cargarHistorial()]);
+      return;
+    }
+
+    if (_horarioHoy != null) {
       return;
     }
 
@@ -194,8 +327,11 @@ class _HomeScreenState extends State<HomeScreen> {
       if (mounted) {
         setState(() => _horarioHoy = horarioGuardado);
       }
-      await _supabaseService.aplicarJornadaManual(_dni, horarioGuardado);
+      await _aplicarJornadaManualSegura(horarioGuardado);
       await Future.wait([_cargarAsistencia(), _cargarHistorial()]);
+      if (mounted) {
+        setState(() => _horarioHoy = horarioGuardado);
+      }
       return;
     }
 
@@ -212,11 +348,14 @@ class _HomeScreenState extends State<HomeScreen> {
         DateTime.now(),
         horarioInferido,
       );
-      await _supabaseService.aplicarJornadaManual(_dni, horarioInferido);
+      await _aplicarJornadaManualSegura(horarioInferido);
       if (mounted) {
         setState(() => _horarioHoy = horarioInferido);
       }
       await Future.wait([_cargarAsistencia(), _cargarHistorial()]);
+      if (mounted) {
+        setState(() => _horarioHoy = horarioInferido);
+      }
       return;
     }
 
@@ -232,17 +371,45 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
+    if (mounted) {
+      setState(() => _horarioHoy = horarioElegido);
+    }
+
     await SessionService().guardarHorarioManual(
       _dni,
       DateTime.now(),
       horarioElegido,
     );
-    await _supabaseService.aplicarJornadaManual(_dni, horarioElegido);
+    await _aplicarJornadaManualSegura(horarioElegido);
 
     if (mounted) {
       setState(() => _horarioHoy = horarioElegido);
     }
-    await Future.wait([_cargarAsistencia(), _cargarHistorial()]);
+    await Future.wait([
+      _cargarAsistencia(),
+      _cargarHistorial(),
+      _cargarTracking(),
+    ]);
+    if (mounted) {
+      setState(() => _horarioHoy = horarioElegido);
+    }
+  }
+
+  Future<void> _aplicarJornadaManualSegura(Map<String, dynamic> horario) async {
+    try {
+      await _supabaseService.aplicarJornadaManual(_dni, horario);
+    } catch (e, st) {
+      AppLogger.error(
+        'Home',
+        'La jornada queda guardada localmente hasta recuperar internet',
+        e,
+        st,
+        {'dni': AppLogger.shortId(_dni)},
+      );
+      if (_supabaseService.esErrorConexion(e) && mounted) {
+        setState(() => _hayInternet = false);
+      }
+    }
   }
 
   Future<void> _cargarHistorial() async {
@@ -255,10 +422,20 @@ class _HomeScreenState extends State<HomeScreen> {
     final mesActual = DateTime(ahora.year, ahora.month);
     final mesAnterior = DateTime(ahora.year, ahora.month - 1);
 
-    final historialActual = await _supabaseService
-        .obtenerHistorialAsistenciasMes(_dni, mesActual);
-    final historialAnterior = await _supabaseService
-        .obtenerHistorialAsistenciasMes(_dni, mesAnterior);
+    final locales = await Future.wait([
+      _localDatabase.obtenerHistorialMes(_dni, mesActual),
+      _localDatabase.obtenerHistorialMes(_dni, mesAnterior),
+    ]);
+    final remotos = await Future.wait([
+      _supabaseService.obtenerHistorialAsistenciasMes(_dni, mesActual),
+      _supabaseService.obtenerHistorialAsistenciasMes(_dni, mesAnterior),
+    ]);
+    final historialActual = _combinarHistorial(remotos[0], locales[0]);
+    final historialAnterior = _combinarHistorial(remotos[1], locales[1]);
+    await Future.wait([
+      _localDatabase.guardarHistorial(_dni, historialActual),
+      _localDatabase.guardarHistorial(_dni, historialAnterior),
+    ]);
 
     if (mounted) {
       AppLogger.info('Home', 'Historial cargado', {
@@ -273,12 +450,212 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _cargarPendientes() async {
+    if (_dni.isEmpty) {
+      return;
+    }
+    final pendientes = await _localDatabase.obtenerMarcacionesPendientes(
+      dni: _dni,
+    );
+    final porFecha = <String, Set<String>>{};
+    for (final pendiente in pendientes) {
+      porFecha
+          .putIfAbsent(pendiente.fecha, () => <String>{})
+          .add(pendiente.tipoMarcacion);
+    }
+    final hoy = _fechaKey(DateTime.now());
+    if (mounted) {
+      setState(() {
+        _cantidadPendientes = pendientes.length;
+        _marcasPendientesPorFecha = porFecha;
+        _marcasPendientesHoy = porFecha[hoy] ?? <String>{};
+      });
+    }
+  }
+
+  Map<String, dynamic>? _combinarAsistenciaVisible({
+    required Map<String, dynamic>? remoto,
+    required Map<String, dynamic>? local,
+    required Map<String, dynamic>? actual,
+  }) {
+    if (remoto == null) {
+      final fallback = actual ?? local;
+      return fallback == null ? null : Map<String, dynamic>.from(fallback);
+    }
+
+    final resultado = Map<String, dynamic>.from(remoto);
+    for (final item in _ordenMarcaciones) {
+      final campo = item.$2;
+      if (_marcaExiste(resultado[campo])) {
+        _marcasVisualesProtegidas.remove(campo);
+        continue;
+      }
+      final protegida =
+          _marcasPendientesHoy.contains(campo) ||
+          _marcasVisualesProtegidas.contains(campo);
+      if (!protegida) {
+        continue;
+      }
+      final valor = actual?[campo] ?? local?[campo];
+      if (_marcaExiste(valor)) {
+        resultado[campo] = valor;
+      }
+    }
+    return resultado;
+  }
+
+  List<Map<String, dynamic>> _combinarHistorial(
+    List<Map<String, dynamic>> remotos,
+    List<Map<String, dynamic>> locales,
+  ) {
+    final porFecha = <String, Map<String, dynamic>>{};
+    for (final local in locales) {
+      final fecha = _fechaRegistro(local);
+      if (fecha != null) {
+        porFecha[_fechaKey(fecha)] = Map<String, dynamic>.from(local);
+      }
+    }
+    for (final remoto in remotos) {
+      final fecha = _fechaRegistro(remoto);
+      if (fecha == null) {
+        continue;
+      }
+      final key = _fechaKey(fecha);
+      final combinado = Map<String, dynamic>.from(remoto);
+      final local = porFecha[key];
+      for (final campo in _marcasPendientesPorFecha[key] ?? const <String>{}) {
+        if (!_marcaExiste(combinado[campo]) && _marcaExiste(local?[campo])) {
+          combinado[campo] = local![campo];
+        }
+      }
+      porFecha[key] = combinado;
+    }
+    final resultado = porFecha.values.toList();
+    resultado.sort((a, b) {
+      final fechaA = _fechaRegistro(a) ?? DateTime(1970);
+      final fechaB = _fechaRegistro(b) ?? DateTime(1970);
+      return fechaB.compareTo(fechaA);
+    });
+    return resultado;
+  }
+
+  Future<void> _sincronizarMarcacionesPendientes() async {
+    if (_sincronizandoPendientes || !_hayInternet) {
+      return;
+    }
+    _sincronizandoPendientes = true;
+    var sincronizadas = 0;
+    try {
+      final pendientes = await _localDatabase.obtenerMarcacionesPendientes();
+      for (final pendiente in pendientes) {
+        try {
+          await _supabaseService.sincronizarMarcacionPendiente(pendiente);
+          await _localDatabase.eliminarPendiente(pendiente.id);
+          sincronizadas++;
+        } catch (e, st) {
+          await _localDatabase.registrarIntento(pendiente.id, e);
+          AppLogger.error(
+            'Home',
+            'No se pudo sincronizar una marcacion pendiente',
+            e,
+            st,
+            {
+              'dni': AppLogger.shortId(pendiente.dni),
+              'tipo': pendiente.tipoMarcacion,
+            },
+          );
+          if (_supabaseService.esErrorConexion(e)) {
+            if (mounted) {
+              setState(() => _hayInternet = false);
+            }
+            break;
+          }
+        }
+      }
+    } finally {
+      _sincronizandoPendientes = false;
+    }
+
+    await _cargarPendientes();
+    if (sincronizadas > 0 && mounted) {
+      await Future.wait([_cargarAsistencia(), _cargarHistorial()]);
+      unawaited(_cargarTracking());
+      _mostrarMensaje(
+        sincronizadas == 1
+            ? 'Se sincronizo 1 marcacion pendiente.'
+            : 'Se sincronizaron $sincronizadas marcaciones pendientes.',
+      );
+    }
+  }
+
+  Future<void> _cargarTracking() async {
+    if (_dni.isEmpty) {
+      AppLogger.warning('Home', 'No se carga tracking porque DNI esta vacio');
+      return;
+    }
+
+    final ahora = DateTime.now();
+    final mesActual = DateTime(ahora.year, ahora.month);
+    final mesAnterior = DateTime(ahora.year, ahora.month - 1);
+
+    final resultados = await Future.wait([
+      _supabaseService.obtenerTrackingDia(widget.usuario, ahora),
+      _supabaseService.obtenerTrackingMes(widget.usuario, mesActual),
+      _supabaseService.obtenerTrackingMes(widget.usuario, mesAnterior),
+    ]);
+
+    if (mounted) {
+      AppLogger.info('Home', 'Tracking cargado', {
+        'dni': AppLogger.shortId(_dni),
+        'hoy': resultados[0].length,
+        'actual': resultados[1].length,
+        'anterior': resultados[2].length,
+      });
+      setState(() {
+        _trackingHoy = resultados[0];
+        _trackingActual = resultados[1];
+        _trackingAnterior = resultados[2];
+      });
+    }
+  }
+
+  Future<void> _sincronizarAsistenciaConTracking() async {
+    if (_sincronizandoTracking || _dni.isEmpty) {
+      return;
+    }
+
+    final asistencias = <Map<String, dynamic>>[
+      ...?(_asistenciaHoy == null ? null : [_asistenciaHoy!]),
+      ..._historialActual,
+      ..._historialAnterior,
+    ];
+    if (asistencias.isEmpty) {
+      return;
+    }
+
+    _sincronizandoTracking = true;
+    try {
+      final cantidad = await _supabaseService.sincronizarAsistenciasEnTracking(
+        widget.usuario,
+        asistencias,
+      );
+      if (cantidad > 0 && mounted) {
+        await _cargarTracking();
+      }
+    } finally {
+      _sincronizandoTracking = false;
+    }
+  }
+
   Future<void> _procesarQR(String qrValue) async {
-    if (_procesando || _qrProcesado || _enCooldown) {
+    final bloqueadoPorCooldown =
+        _modoRegistro == _ModoRegistro.asistencia && _enCooldown;
+    if (_procesando || _qrProcesado || bloqueadoPorCooldown) {
       AppLogger.warning('Home', 'QR ignorado por estado de scanner', {
         'procesando': _procesando,
         'qr_procesado': _qrProcesado,
-        'cooldown': _enCooldown,
+        'cooldown': bloqueadoPorCooldown,
+        'modo': _modoRegistro.name,
       });
       return;
     }
@@ -287,6 +664,7 @@ class _HomeScreenState extends State<HomeScreen> {
       'dni': AppLogger.shortId(_dni),
       'raw_length': qrValue.length,
       'raw_preview': _debugPreview(qrValue),
+      'modo': _modoRegistro.name,
     });
 
     setState(() {
@@ -295,61 +673,175 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     final resultado = await _qrService.validarQR(qrValue, widget.usuario);
+    AppLogger.info('Home', 'Resultado validacion QR', {
+      'valido': resultado.valido,
+      'mensaje': resultado.mensajeError ?? '',
+      'id_tienda': AppLogger.shortId(resultado.qrValidado?.idTienda ?? ''),
+      'tienda': resultado.qrValidado?.nombreTienda ?? '',
+      'ubicacion_actual': resultado.ubicacion == null ? 'no' : 'si',
+      'qr_ubicacion_keys':
+          resultado.qrValidado?.ubicacionQr.keys.join(',') ?? '',
+    });
     if (!resultado.valido ||
         resultado.qrValidado == null ||
         resultado.ubicacion == null) {
-      AppLogger.warning('Home', 'QR invalido', {
-        'mensaje': resultado.mensajeError ?? 'sin_mensaje',
-      });
-      _mostrarMensaje(
-        resultado.mensajeError ?? 'No se pudo validar el QR.',
-        esError: true,
-      );
+      final mensajeError =
+          resultado.mensajeError ?? 'No se pudo validar el QR.';
+      AppLogger.warning('Home', 'QR invalido', {'mensaje': mensajeError});
+      _mostrarMensaje(mensajeError, esError: true);
+      if (_esErrorRequisito(mensajeError)) {
+        _abrirFlujoRequisitos();
+        return;
+      }
       _reiniciarScanner();
       return;
     }
 
+    DeviceCredentials? dispositivo;
+    if (_modoRegistro == _ModoRegistro.asistencia) {
+      try {
+        final vinculado = await _deviceSecurity.estaVinculadoLocalmente(_dni);
+        if (!vinculado) {
+          throw const DeviceSecurityException(
+            'Este celular no esta vinculado a tu usuario. Cierra sesion e ingresa nuevamente.',
+          );
+        }
+        await _deviceSecurity.autenticar(
+          motivo: 'Confirma tu identidad para registrar esta asistencia.',
+        );
+        dispositivo = await _deviceSecurity.obtenerCredenciales(
+          crearSiFaltan: false,
+        );
+      } on DeviceSecurityException catch (e, st) {
+        AppLogger.error(
+          'Home',
+          'Marcacion cancelada por validacion biometrica',
+          e,
+          st,
+          {'dni': AppLogger.shortId(_dni)},
+        );
+        _mostrarMensaje(e.message, esError: true);
+        _reiniciarScanner();
+        return;
+      }
+    }
+
     try {
-      AppLogger.info('Home', 'Registrando marcacion desde QR', {
-        'dni': AppLogger.shortId(_dni),
-        'id_tienda_qr': AppLogger.shortId(resultado.qrValidado!.idTienda),
-      });
+      if (_modoRegistro == _ModoRegistro.tracking) {
+        AppLogger.info('Home', 'Registrando tracking desde QR', {
+          'dni': AppLogger.shortId(_dni),
+          'id_tienda_qr': AppLogger.shortId(resultado.qrValidado!.idTienda),
+        });
 
-      final marcacion = await _supabaseService.registrarMarcacion(
-        widget.usuario,
-        resultado.qrValidado!,
-        ubicacion: resultado.ubicacion!,
-        horarioManual: _horarioManualActivo ? _horarioHoy : null,
-      );
+        final tracking = await _supabaseService.registrarMovimientoPersonal(
+          widget.usuario,
+          resultado.qrValidado!,
+          ubicacion: resultado.ubicacion!,
+        );
 
-      await _cargarDatos();
-      final enCooldown = marcacion.startsWith('Debes esperar');
-      AppLogger.info('Home', 'Marcacion procesada', {
-        'dni': AppLogger.shortId(_dni),
-        'resultado': marcacion,
-        'tienda': resultado.qrValidado!.nombreTienda,
-      });
-      final marcacionExitosa = _esMarcacionExitosa(marcacion);
-      _mostrarMensaje(
-        _mensajeMarcacionUsuario(marcacion, resultado.qrValidado!.nombreTienda),
-        esError: !marcacionExitosa,
-      );
+        AppLogger.info('Home', 'Tracking procesado', {
+          'dni': AppLogger.shortId(_dni),
+          'resultado': tracking,
+          'tienda': resultado.qrValidado!.nombreTienda,
+        });
+        await _cargarTracking();
+        final tiendaTracking = resultado.qrValidado!.nombreTienda;
+        _mostrarMensaje(
+          tiendaTracking == 'QR de tienda'
+              ? tracking
+              : '$tracking en $tiendaTracking',
+        );
+      } else {
+        AppLogger.info('Home', 'Registrando marcacion desde QR', {
+          'dni': AppLogger.shortId(_dni),
+          'id_tienda_qr': AppLogger.shortId(resultado.qrValidado!.idTienda),
+          'tienda': resultado.qrValidado!.nombreTienda,
+          'lat': resultado.ubicacion!['latitude']?.toStringAsFixed(6),
+          'lng': resultado.ubicacion!['longitude']?.toStringAsFixed(6),
+          'horario_manual': _horarioManualActivo,
+          'tipo_jornada': _horarioHoy?['tipo_jornada']?.toString() ?? '',
+        });
 
-      if (mounted) {
-        if (marcacionExitosa) {
-          _iniciarCooldown(_cooldownMarcacion);
-        } else if (enCooldown) {
-          _iniciarCooldown(_extraerEsperaCooldown(marcacion));
+        final siguienteEsperada = _siguienteCampoMarcacion();
+        var guardadaOffline = false;
+        late final String marcacion;
+        if (!_hayInternet) {
+          marcacion = await _registrarMarcacionOffline(
+            resultado.qrValidado!,
+            resultado.ubicacion!,
+          );
+          guardadaOffline = true;
+        } else {
+          try {
+            marcacion = await _supabaseService.registrarMarcacion(
+              widget.usuario,
+              resultado.qrValidado!,
+              ubicacion: resultado.ubicacion!,
+              horarioManual: _horarioManualActivo ? _horarioHoy : null,
+              horarioDia: _horarioManualActivo ? null : _horarioHoy,
+              dispositivo: dispositivo,
+            );
+          } catch (e) {
+            if (!_supabaseService.esErrorConexion(e)) {
+              rethrow;
+            }
+            if (mounted) {
+              setState(() => _hayInternet = false);
+            }
+            marcacion = await _registrarMarcacionOffline(
+              resultado.qrValidado!,
+              resultado.ubicacion!,
+            );
+            guardadaOffline = true;
+          }
+        }
+
+        final enCooldown = marcacion.startsWith('Debes esperar');
+        AppLogger.info('Home', 'Marcacion procesada', {
+          'dni': AppLogger.shortId(_dni),
+          'resultado': marcacion,
+          'tienda': resultado.qrValidado!.nombreTienda,
+        });
+        final marcacionExitosa = _esMarcacionExitosa(marcacion);
+        if (marcacionExitosa && !guardadaOffline) {
+          _aplicarMarcaVisual(marcacion, campoPreferido: siguienteEsperada);
+        }
+        final mensajeUsuario = _mensajeMarcacionUsuario(
+          marcacion,
+          resultado.qrValidado!.nombreTienda,
+        );
+        _mostrarMensaje(
+          guardadaOffline && marcacionExitosa
+              ? '$mensajeUsuario. Pendiente de sincronizar.'
+              : mensajeUsuario,
+          esError: !marcacionExitosa,
+        );
+
+        if (guardadaOffline) {
+          await _cargarPendientes();
+          _actualizarHistorialConAsistenciaActual();
+        } else {
+          await _recargarDespuesDeMarcacion();
+        }
+
+        if (mounted) {
+          if (marcacionExitosa) {
+            _iniciarCooldown(_cooldownMarcacion);
+          } else if (enCooldown) {
+            _iniciarCooldown(_extraerEsperaCooldown(marcacion));
+          }
         }
       }
     } catch (e, st) {
       AppLogger.error('Home', 'Error procesando QR', e, st, {
         'dni': AppLogger.shortId(_dni),
+        'modo': _modoRegistro.name,
+        'error_type': e.runtimeType.toString(),
       });
-      _mostrarMensaje(
-        'No se pudo registrar la marcacion en este momento. Intenta de nuevo.',
-        esError: true,
-      );
+      final accion = _modoRegistro == _ModoRegistro.tracking
+          ? 'el tracking'
+          : 'la marcacion';
+      _mostrarMensaje(_mensajeErrorRegistro(e, accion), esError: true);
     }
 
     if (mounted) {
@@ -382,18 +874,264 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
+  Future<void> _abrirScannerConRequisitos() async {
+    final requisitos = await _requirementsService.check();
+    if (!mounted) {
+      return;
+    }
+
+    if (_hayInternet != requisitos.hasInternet) {
+      setState(() => _hayInternet = requisitos.hasInternet);
+    }
+
+    if (!requisitos.ready) {
+      _abrirFlujoRequisitos();
+      return;
+    }
+
+    setState(() => _escaneando = true);
+  }
+
+  void _abrirFlujoRequisitos({bool abrirScannerAutomatico = true}) {
+    if (!mounted || _redirigiendoRequisitos) {
+      return;
+    }
+
+    _redirigiendoRequisitos = true;
+    _requirementsTimer?.cancel();
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => AppRequirementsScreen(
+          usuario: widget.usuario,
+          themeMode: widget.themeMode,
+          onThemeToggle: widget.onThemeToggle,
+          abrirScannerAutomatico: abrirScannerAutomatico,
+        ),
+      ),
+    );
+  }
+
+  bool _esErrorRequisito(String mensaje) {
+    final normalizado = mensaje.toLowerCase();
+    return normalizado.contains('ubicacion') ||
+        normalizado.contains('gps') ||
+        normalizado.contains('permiso') ||
+        normalizado.contains('camara') ||
+        normalizado.contains('internet');
+  }
+
+  String _mensajeErrorRegistro(Object error, String accion) {
+    final raw = error.toString().replaceFirst('Exception: ', '').trim();
+    final normalizado = raw.toLowerCase();
+    final mensajeSeguro =
+        normalizado.contains('fuera del rango') ||
+        normalizado.contains('ubicacion') ||
+        normalizado.contains('gps') ||
+        normalizado.contains('permiso') ||
+        normalizado.contains('codigo de asistencia') ||
+        normalizado.contains('código de asistencia') ||
+        normalizado.contains('codigo no valido') ||
+        normalizado.contains('no se pudo validar') ||
+        normalizado.contains('resolver el qr') ||
+        normalizado.contains('qr dinamico') ||
+        normalizado.contains('rango') ||
+        normalizado.contains('postgrestexception') ||
+        normalizado.contains('supabase') ||
+        normalizado.contains('schema cache') ||
+        normalizado.contains('could not find') ||
+        normalizado.contains('column') ||
+        normalizado.contains('permission denied') ||
+        normalizado.contains('row-level security') ||
+        normalizado.contains('violates') ||
+        normalizado.contains('invalid input') ||
+        normalizado.contains('json') ||
+        normalizado.contains('pgrst') ||
+        normalizado.contains('token') ||
+        normalizado.contains('qr invalido') ||
+        normalizado.contains('qr inválido') ||
+        normalizado.contains('ultima marca') ||
+        normalizado.contains('última marca') ||
+        normalizado.contains('primero registra') ||
+        normalizado.contains('entrada antes') ||
+        normalizado.contains('debes esperar') ||
+        normalizado.contains('completaste todas') ||
+        normalizado.contains('ya existia') ||
+        normalizado.contains('ya existía');
+
+    if (mensajeSeguro && raw.isNotEmpty) {
+      return raw;
+    }
+
+    return 'No se pudo registrar $accion en este momento. Intenta de nuevo.';
+  }
+
+  Future<String> _registrarMarcacionOffline(
+    QRValidado qr,
+    Map<String, double> ubicacion,
+  ) async {
+    if (qr.token.startsWith('app-qr-dinamico://')) {
+      throw Exception(
+        'El QR dinamico necesita internet para comprobar que sigue vigente.',
+      );
+    }
+
+    final tipoMarcacion = _siguienteCampoMarcacion();
+    if (tipoMarcacion == null) {
+      return 'Ya completaste todas las marcaciones de hoy';
+    }
+    _supabaseService.validarRangoQrLocal(
+      qr,
+      ubicacion,
+      tipoMarcacion: tipoMarcacion,
+    );
+
+    final ahora = DateTime.now();
+    final asistencia = <String, dynamic>{
+      'dni_trabajador': _dni,
+      'fecha': _fechaKey(ahora),
+      'horario_entrada': null,
+      'horario_inicio_receso': null,
+      'horario_fin_receso': null,
+      'horario_salida': null,
+      'justificado': !_horarioManualActivo && _horarioHoy != null,
+      ...?_asistenciaHoy,
+      tipoMarcacion: ahora.toIso8601String(),
+    };
+    final pendiente = MarcacionPendiente(
+      id: const Uuid().v4(),
+      dni: _dni,
+      fecha: _fechaKey(ahora),
+      tipoMarcacion: tipoMarcacion,
+      marcadoEn: ahora,
+      usuario: Map<String, dynamic>.from(widget.usuario),
+      qr: qr.toMap(),
+      ubicacion: Map<String, double>.from(ubicacion),
+      horarioManual: _horarioManualActivo && _horarioHoy != null
+          ? Map<String, dynamic>.from(_horarioHoy!)
+          : null,
+      horarioDia: !_horarioManualActivo && _horarioHoy != null
+          ? Map<String, dynamic>.from(_horarioHoy!)
+          : null,
+    );
+    await _localDatabase.encolarMarcacion(pendiente);
+    if (mounted) {
+      setState(() {
+        _asistenciaHoy = asistencia;
+        _marcasPendientesHoy = {..._marcasPendientesHoy, tipoMarcacion};
+      });
+      _actualizarCooldownDesdeAsistencia(asistencia);
+    }
+    return _nombreCampoMarcacion(tipoMarcacion);
+  }
+
+  String? _siguienteCampoMarcacion() {
+    for (final item in _marcacionesParaHorario(_horarioHoy)) {
+      if (!_marcaExiste(_asistenciaHoy?[item.$2])) {
+        return item.$2;
+      }
+    }
+    return null;
+  }
+
+  void _aplicarMarcaVisual(String mensaje, {String? campoPreferido}) {
+    final campo = _campoDesdeMensaje(mensaje) ?? campoPreferido;
+    if (campo == null || !mounted) {
+      return;
+    }
+    final ahora = DateTime.now().toIso8601String();
+    final asistencia = <String, dynamic>{
+      'dni_trabajador': _dni,
+      'fecha': _fechaKey(DateTime.now()),
+      'horario_entrada': null,
+      'horario_inicio_receso': null,
+      'horario_fin_receso': null,
+      'horario_salida': null,
+      ...?_asistenciaHoy,
+      campo: ahora,
+    };
+    setState(() {
+      _asistenciaHoy = asistencia;
+      _marcasVisualesProtegidas.add(campo);
+    });
+    unawaited(_localDatabase.guardarAsistencia(asistencia));
+  }
+
+  String? _campoDesdeMensaje(String mensaje) {
+    switch (mensaje.trim().toLowerCase()) {
+      case 'entrada':
+        return 'horario_entrada';
+      case 'inicio de receso':
+        return 'horario_inicio_receso';
+      case 'fin de receso':
+        return 'horario_fin_receso';
+      case 'salida':
+        return 'horario_salida';
+    }
+    return null;
+  }
+
+  String _nombreCampoMarcacion(String campo) {
+    return switch (campo) {
+      'horario_entrada' => 'Entrada',
+      'horario_inicio_receso' => 'Inicio de receso',
+      'horario_fin_receso' => 'Fin de receso',
+      'horario_salida' => 'Salida',
+      _ => 'Marcacion registrada',
+    };
+  }
+
+  void _actualizarHistorialConAsistenciaActual() {
+    final asistencia = _asistenciaHoy;
+    if (asistencia == null || !mounted) {
+      return;
+    }
+    final fecha = _fechaRegistro(asistencia);
+    if (fecha == null) {
+      return;
+    }
+    final key = _fechaKey(fecha);
+    final actualizados = [
+      Map<String, dynamic>.from(asistencia),
+      ..._historialActual.where((item) {
+        final itemFecha = _fechaRegistro(item);
+        return itemFecha == null || _fechaKey(itemFecha) != key;
+      }),
+    ];
+    setState(() => _historialActual = actualizados);
+  }
+
+  Future<void> _recargarDespuesDeMarcacion() async {
+    await _ejecutarRecargaParcial('asistencia', _cargarAsistencia);
+    await _ejecutarRecargaParcial('historial', _cargarHistorial);
+    await _ejecutarRecargaParcial('tracking', _cargarTracking);
+    await _ejecutarRecargaParcial(
+      'sincronizacion_tracking',
+      _sincronizarAsistenciaConTracking,
+    );
+    await _ejecutarRecargaParcial('horario_dia', _verificarHorarioDelDia);
+  }
+
+  Future<void> _ejecutarRecargaParcial(
+    String nombre,
+    Future<void> Function() accion,
+  ) async {
+    try {
+      await accion();
+    } catch (e, st) {
+      AppLogger.error('Home', 'Error en recarga parcial', e, st, {
+        'dni': AppLogger.shortId(_dni),
+        'parte': nombre,
+      });
+    }
+  }
+
   void _mostrarMensaje(String msg, {bool esError = false}) {
     if (!mounted) {
       return;
     }
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        duration: const Duration(seconds: 3),
-        backgroundColor: esError ? AppPalette.error : AppPalette.verdeAzulado,
-      ),
-    );
+    TopMessageService.show(context, msg, isError: esError);
   }
 
   bool get _horarioManualActivo =>
@@ -406,6 +1144,31 @@ class _HomeScreenState extends State<HomeScreen> {
       return null;
     }
 
+    final ubicacionesRaw = asistencia['ubicaciones'];
+    Map<String, dynamic> ubicaciones = <String, dynamic>{};
+    if (ubicacionesRaw is Map) {
+      ubicaciones = Map<String, dynamic>.from(ubicacionesRaw);
+    } else if (ubicacionesRaw is String && ubicacionesRaw.trim().isNotEmpty) {
+      try {
+        final decoded = jsonDecode(ubicacionesRaw);
+        if (decoded is Map) {
+          ubicaciones = Map<String, dynamic>.from(decoded);
+        }
+      } catch (_) {
+        // Se intenta la inferencia por marcas como compatibilidad.
+      }
+    }
+    final jornadaRaw = ubicaciones['_jornada_manual'];
+    if (jornadaRaw is Map) {
+      final tipo = jornadaRaw['tipo_jornada']?.toString().toLowerCase();
+      if (tipo == 'parttime' || tipo == 'part_time' || tipo == '2_marcas') {
+        return _horarioManual('parttime');
+      }
+      if (tipo == 'fulltime' || tipo == 'full_time' || tipo == '4_marcas') {
+        return _horarioManual('fulltime');
+      }
+    }
+
     final tieneEntrada = _marcaExiste(asistencia['horario_entrada']);
     final tieneSalida = _marcaExiste(asistencia['horario_salida']);
     final tieneReceso =
@@ -416,11 +1179,11 @@ class _HomeScreenState extends State<HomeScreen> {
       return _horarioManual('fulltime');
     }
 
-    if (!tieneEntrada && !tieneSalida) {
-      return null;
+    if (tieneEntrada && tieneSalida) {
+      return _horarioManual('parttime');
     }
 
-    return _horarioManual('parttime');
+    return null;
   }
 
   Map<String, dynamic> _horarioManual(String key) {
@@ -895,6 +1658,461 @@ class _HomeScreenState extends State<HomeScreen> {
     return DateTime.tryParse(fecha.toString());
   }
 
+  String _fechaKey(DateTime fecha) {
+    final local = fecha.toLocal();
+    return '${local.year.toString().padLeft(4, '0')}-'
+        '${local.month.toString().padLeft(2, '0')}-'
+        '${local.day.toString().padLeft(2, '0')}';
+  }
+
+  DateTime? _fechaTracking(Map<String, dynamic> registro) {
+    final ubicaciones = _ubicacionesTracking(registro);
+    return _parseSupabaseDateTime(
+      registro['Fecha'] ??
+          registro['fecha'] ??
+          registro['hora_marca'] ??
+          ubicaciones['hora_marca'] ??
+          ubicaciones['registrado_en'],
+    );
+  }
+
+  Map<String, dynamic> _ubicacionesTracking(Map<String, dynamic> registro) {
+    final ubicaciones = registro['ubicaciones'] ?? registro['ubicacion'];
+    final resultado = <String, dynamic>{};
+    if (ubicaciones is Map<String, dynamic>) {
+      resultado.addAll(ubicaciones);
+    } else if (ubicaciones is Map) {
+      resultado.addAll(Map<String, dynamic>.from(ubicaciones));
+    } else if (ubicaciones is String && ubicaciones.trim().isNotEmpty) {
+      try {
+        final parsed = jsonDecode(ubicaciones);
+        if (parsed is Map<String, dynamic>) {
+          resultado.addAll(parsed);
+        } else if (parsed is Map) {
+          resultado.addAll(Map<String, dynamic>.from(parsed));
+        }
+      } catch (_) {
+        // Los exports antiguos pueden traer JSON como texto; si no parsea,
+        // seguimos con los campos planos del registro.
+      }
+    }
+
+    void agregarSiFalta(String clave, Object? valor) {
+      if (valor != null && !resultado.containsKey(clave)) {
+        resultado[clave] = valor;
+      }
+    }
+
+    agregarSiFalta('dni_trabajador', registro['id_trabajador']);
+    agregarSiFalta('id_tienda_qr', registro['id_tienda']);
+    agregarSiFalta('hora_marca', registro['hora_marca']);
+    agregarSiFalta('registrado_en', registro['hora_marca']);
+    agregarSiFalta('tipo', registro['tipo']);
+    agregarSiFalta('nombre_tienda', registro['nombre_tienda']);
+    agregarSiFalta('direccion_tienda', registro['direccion_tienda']);
+    agregarSiFalta('nombre_trabajador', registro['nombre_trabajador']);
+    agregarSiFalta('cargo_trabajador', registro['cargo_trabajador']);
+
+    return resultado;
+  }
+
+  List<Map<String, dynamic>> _trackingOrdenado(
+    Iterable<Map<String, dynamic>> registros,
+  ) {
+    final ordenados = registros.map(Map<String, dynamic>.from).toList();
+    ordenados.sort((a, b) {
+      final fechaA = _fechaTracking(a);
+      final fechaB = _fechaTracking(b);
+      if (fechaA == null && fechaB == null) {
+        return 0;
+      }
+      if (fechaA == null) {
+        return 1;
+      }
+      if (fechaB == null) {
+        return -1;
+      }
+      return fechaA.compareTo(fechaB);
+    });
+    return ordenados;
+  }
+
+  List<Map<String, dynamic>> _trackingCombinado(
+    Iterable<Map<String, dynamic>> tracking,
+    Map<String, dynamic>? asistencia,
+  ) {
+    if (asistencia == null || !_marcaExiste(asistencia['horario_entrada'])) {
+      return [];
+    }
+
+    final sinteticos = _trackingDesdeAsistencia(asistencia);
+    final sinteticosPorFecha = <String, Map<String, dynamic>>{};
+    for (final sintetico in sinteticos) {
+      final clave = _claveFechaTracking(sintetico);
+      if (clave.isNotEmpty) {
+        sinteticosPorFecha[clave] = sintetico;
+      }
+    }
+
+    final fechasNormalesReales = <String>{};
+    final registros = <Map<String, dynamic>>[];
+
+    for (final registro in tracking) {
+      final esNormal = _tipoMovimientoTracking(registro) == 'NORMAL';
+      if (!esNormal) {
+        registros.add(registro);
+        continue;
+      }
+
+      final clave = _claveFechaTracking(registro);
+      final sintetico =
+          sinteticosPorFecha[clave] ??
+          _sinteticoCercanoParaTrackingNormal(registro, sinteticos);
+      final tipoExplicito = _tipoMarcacionExplicita(registro);
+      if (sintetico == null && tipoExplicito == null) {
+        continue;
+      }
+      final claveSintetico = sintetico == null
+          ? ''
+          : _claveFechaTracking(sintetico);
+      if (claveSintetico.isNotEmpty) {
+        fechasNormalesReales.add(claveSintetico);
+      }
+      registros.add(_fusionarTrackingNormal(registro, sintetico));
+    }
+
+    for (final sintetico in sinteticos) {
+      final clave = _claveFechaTracking(sintetico);
+      if (clave.isEmpty || !fechasNormalesReales.contains(clave)) {
+        registros.add(sintetico);
+      }
+    }
+
+    return _deduplicarTrackingVisual(registros);
+  }
+
+  List<Map<String, dynamic>> _trackingDesdeAsistencia(
+    Map<String, dynamic>? asistencia,
+  ) {
+    if (asistencia == null) {
+      return [];
+    }
+
+    final registros = <Map<String, dynamic>>[];
+    final ubicaciones = asistencia['ubicaciones'] is Map
+        ? Map<String, dynamic>.from(asistencia['ubicaciones'] as Map)
+        : <String, dynamic>{};
+    String valorConFallback(Object? valor, String fallback) {
+      final texto = valor?.toString().trim() ?? '';
+      return texto.isNotEmpty ? texto : fallback;
+    }
+
+    for (final item in _marcacionesParaDetalle(asistencia)) {
+      final marca = asistencia[item.$2];
+      if (!_marcaExiste(marca)) {
+        continue;
+      }
+
+      final detalleUbicacion = ubicaciones[item.$2] is Map
+          ? Map<String, dynamic>.from(ubicaciones[item.$2] as Map)
+          : <String, dynamic>{};
+
+      registros.add({
+        'Fecha': marca,
+        'ubicaciones': {
+          'latitud': detalleUbicacion['latitud'],
+          'longitud': detalleUbicacion['longitud'],
+          'id_tienda_qr': valorConFallback(
+            detalleUbicacion['id_tienda_qr'],
+            widget.usuario['id_tienda']?.toString() ?? '',
+          ),
+          'nombre_tienda': valorConFallback(
+            detalleUbicacion['nombre_tienda'],
+            widget.usuario['nombre_tienda']?.toString() ?? 'Tienda asignada',
+          ),
+          'direccion_tienda': valorConFallback(
+            detalleUbicacion['direccion_tienda'],
+            widget.usuario['direccion_tienda']?.toString() ?? '',
+          ),
+          'dni_trabajador': _dni,
+          'nombre_trabajador': widget.usuario['nombre']?.toString() ?? '',
+          'cargo_trabajador': widget.usuario['cargo']?.toString() ?? '',
+          'tipo_marcacion': item.$1,
+          'origen': 'normal',
+          'tipo': 'NORMAL',
+          'registrado_en': marca.toString(),
+        },
+      });
+    }
+
+    return registros;
+  }
+
+  Map<String, dynamic>? _sinteticoCercanoParaTrackingNormal(
+    Map<String, dynamic> real,
+    List<Map<String, dynamic>> sinteticos,
+  ) {
+    if (_tipoMovimientoTracking(real) != 'NORMAL') {
+      return null;
+    }
+
+    final fechaReal = _fechaTracking(real)?.toLocal();
+    if (fechaReal == null) {
+      return null;
+    }
+
+    final tipoReal = _tipoMarcacionExplicita(real);
+    Map<String, dynamic>? mejor;
+    Duration? menorDiferencia;
+
+    for (final sintetico in sinteticos) {
+      final fechaSintetica = _fechaTracking(sintetico)?.toLocal();
+      if (fechaSintetica == null ||
+          fechaSintetica.year != fechaReal.year ||
+          fechaSintetica.month != fechaReal.month ||
+          fechaSintetica.day != fechaReal.day) {
+        continue;
+      }
+
+      final tipoSintetico = _tipoMarcacionExplicita(sintetico);
+      if (tipoReal != null &&
+          tipoSintetico != null &&
+          tipoReal != tipoSintetico) {
+        continue;
+      }
+
+      final diferencia = fechaSintetica.difference(fechaReal).abs();
+      if (diferencia > _toleranciaFusionMarcacionNormal) {
+        continue;
+      }
+
+      if (menorDiferencia == null || diferencia < menorDiferencia) {
+        menorDiferencia = diferencia;
+        mejor = sintetico;
+      }
+    }
+
+    return mejor;
+  }
+
+  String _claveFechaTracking(Map<String, dynamic> registro) {
+    final fecha = _fechaTracking(registro)?.toLocal();
+    if (fecha == null) {
+      return registro['Fecha']?.toString() ??
+          registro['hora_marca']?.toString() ??
+          '';
+    }
+
+    return DateTime(
+      fecha.year,
+      fecha.month,
+      fecha.day,
+      fecha.hour,
+      fecha.minute,
+      fecha.second,
+    ).toIso8601String();
+  }
+
+  Map<String, dynamic> _fusionarTrackingNormal(
+    Map<String, dynamic> real,
+    Map<String, dynamic>? sintetico,
+  ) {
+    if (sintetico == null) {
+      return real;
+    }
+
+    final combinado = Map<String, dynamic>.from(real);
+    final ubicacionReal = _ubicacionesTracking(real);
+    final ubicacionSintetica = _ubicacionesTracking(sintetico);
+    final ubicaciones = <String, dynamic>{
+      ...ubicacionSintetica,
+      ...ubicacionReal,
+    };
+
+    final tipoReal = ubicacionReal['tipo_marcacion']?.toString().trim();
+    if (tipoReal == null || tipoReal.isEmpty) {
+      ubicaciones['tipo_marcacion'] = ubicacionSintetica['tipo_marcacion'];
+    }
+
+    ubicaciones['origen'] = 'normal';
+    ubicaciones['tipo'] = 'NORMAL';
+    combinado['ubicaciones'] = ubicaciones;
+    return combinado;
+  }
+
+  List<Map<String, dynamic>> _deduplicarTrackingVisual(
+    Iterable<Map<String, dynamic>> registros,
+  ) {
+    final posiciones = <String, int>{};
+    final resultado = <Map<String, dynamic>>[];
+
+    for (final registro in _trackingOrdenado(registros)) {
+      final ubicaciones = _ubicacionesTracking(registro);
+      final fecha =
+          _fechaTracking(registro)?.toIso8601String() ??
+          registro['Fecha']?.toString() ??
+          '';
+      final tipoMovimiento = _tipoMovimientoTracking(registro);
+      final key = [
+        fecha,
+        tipoMovimiento,
+        tipoMovimiento == 'NORMAL'
+            ? _tipoTracking(registro)
+            : ubicaciones['id_tienda_qr']?.toString() ?? '',
+      ].join('|');
+      final posicion = posiciones[key];
+      if (posicion == null) {
+        posiciones[key] = resultado.length;
+        resultado.add(registro);
+        continue;
+      }
+
+      final actual = resultado[posicion];
+      final actualTieneNombre =
+          _ubicacionesTracking(
+            actual,
+          )['tipo_marcacion']?.toString().trim().isNotEmpty ==
+          true;
+      final nuevoTieneNombre =
+          ubicaciones['tipo_marcacion']?.toString().trim().isNotEmpty == true;
+      if (!actualTieneNombre && nuevoTieneNombre) {
+        resultado[posicion] = registro;
+      }
+    }
+
+    return resultado;
+  }
+
+  Color _colorModo(_ModoRegistro modo) {
+    return modo == _ModoRegistro.asistencia
+        ? AppPalette.verdeAzulado
+        : AppPalette.celesteClaro;
+  }
+
+  List<Map<String, dynamic>> _trackingParaDia(
+    List<Map<String, dynamic>> registros,
+    DateTime mes,
+    int? dia,
+  ) {
+    if (dia == null) {
+      return [];
+    }
+
+    return _trackingOrdenado(
+      registros.where((reg) {
+        final fecha = _fechaTracking(reg)?.toLocal();
+        return fecha != null &&
+            fecha.year == mes.year &&
+            fecha.month == mes.month &&
+            fecha.day == dia;
+      }),
+    );
+  }
+
+  String _nombreTiendaTracking(Map<String, dynamic> registro) {
+    final ubicaciones = _ubicacionesTracking(registro);
+    final nombres = [
+      ubicaciones['nombre_tienda']?.toString().trim(),
+      registro['nombre_tienda']?.toString().trim(),
+    ];
+    for (final nombre in nombres) {
+      if (nombre != null && nombre.isNotEmpty) {
+        return nombre;
+      }
+    }
+
+    final ids = [
+      ubicaciones['id_tienda_qr']?.toString().trim(),
+      registro['id_tienda']?.toString().trim(),
+    ];
+    for (final idTienda in ids) {
+      if (idTienda != null && idTienda.isNotEmpty) {
+        return 'Tienda $idTienda';
+      }
+    }
+
+    return 'Tienda';
+  }
+
+  String _horaTracking(Map<String, dynamic> registro, {bool corta = false}) {
+    final fecha = _fechaTracking(registro)?.toLocal();
+    if (fecha == null) {
+      return '--:--';
+    }
+    return DateFormat(corta ? 'HH:mm' : 'hh:mm a').format(fecha);
+  }
+
+  String _tipoTracking(Map<String, dynamic> registro) {
+    final tipo = _tipoMarcacionExplicita(registro);
+    if (tipo != null && tipo.isNotEmpty) {
+      return tipo;
+    }
+    return _tipoMovimientoTracking(registro) == 'NORMAL'
+        ? 'Marca normal'
+        : 'Marca';
+  }
+
+  String? _tipoMarcacionExplicita(Map<String, dynamic> registro) {
+    final ubicaciones = _ubicacionesTracking(registro);
+    final candidatos = [
+      ubicaciones['tipo_marcacion'],
+      registro['tipo_marcacion'],
+    ];
+
+    for (final candidato in candidatos) {
+      final tipo = candidato?.toString().trim();
+      if (tipo != null && tipo.isNotEmpty) {
+        return tipo;
+      }
+    }
+
+    return null;
+  }
+
+  String _subtituloTracking(Map<String, dynamic> registro) {
+    return 'Sede: ${_nombreTiendaTracking(registro)}';
+  }
+
+  String _tipoMovimientoTracking(Map<String, dynamic> registro) {
+    final ubicaciones = _ubicacionesTracking(registro);
+    final candidatos = [
+      ubicaciones['tipo'],
+      registro['tipo'],
+      ubicaciones['origen'],
+      registro['origen'],
+    ];
+
+    for (final candidato in candidatos) {
+      final tipo = candidato?.toString().trim().toUpperCase();
+      if (tipo == null || tipo.isEmpty) {
+        continue;
+      }
+      if (tipo == 'NORMAL') {
+        return 'NORMAL';
+      }
+      if (tipo == 'MULTIPLE' ||
+          tipo == 'PUNTO_A_B' ||
+          tipo == 'PUNTO-A-B' ||
+          tipo == 'PUNTO A B' ||
+          tipo == 'TRACKING') {
+        return 'MULTIPLE';
+      }
+    }
+
+    return 'MULTIPLE';
+  }
+
+  Color _colorTrackingRegistro(Map<String, dynamic> registro) {
+    if (_tipoMovimientoTracking(registro) == 'NORMAL') {
+      return AppPalette.verdeAzulado;
+    }
+    return AppPalette.celesteClaro;
+  }
+
+  String _contadorTracking(int cantidad) {
+    return cantidad == 1 ? '1 marca' : '$cantidad marcas';
+  }
+
   bool _marcaExiste(Object? value) {
     return value != null && value.toString().trim().isNotEmpty;
   }
@@ -946,6 +2164,10 @@ class _HomeScreenState extends State<HomeScreen> {
       return 'Ya completaste tus marcaciones de hoy.';
     }
 
+    if (mensaje.startsWith('Tu ultima marca de tracking')) {
+      return mensaje;
+    }
+
     return 'No se pudo registrar la marcacion. Intenta de nuevo.';
   }
 
@@ -988,7 +2210,66 @@ class _HomeScreenState extends State<HomeScreen> {
     ];
   }
 
+  Widget _buildModoRegistroControl() {
+    final scheme = Theme.of(context).colorScheme;
+
+    return SizedBox(
+      width: double.infinity,
+      child: SegmentedButton<_ModoRegistro>(
+        showSelectedIcon: false,
+        segments: const [
+          ButtonSegment(
+            value: _ModoRegistro.asistencia,
+            icon: Icon(Icons.badge_outlined, size: 18),
+            label: Text('Asistencia'),
+          ),
+          ButtonSegment(
+            value: _ModoRegistro.tracking,
+            icon: Icon(Icons.route_outlined, size: 18),
+            label: Text('Tracking'),
+          ),
+        ],
+        selected: {_modoRegistro},
+        style: ButtonStyle(
+          backgroundColor: WidgetStateProperty.resolveWith((states) {
+            if (states.contains(WidgetState.selected)) {
+              return _colorModo(_modoRegistro).withValues(alpha: 0.92);
+            }
+            return AppTheme.glassSurface(context, alpha: 0.44);
+          }),
+          foregroundColor: WidgetStateProperty.resolveWith((states) {
+            if (states.contains(WidgetState.selected)) {
+              return Colors.white;
+            }
+            return scheme.onSurface.withValues(alpha: 0.82);
+          }),
+          side: WidgetStatePropertyAll(
+            BorderSide(
+              color: _colorModo(_modoRegistro).withValues(alpha: 0.42),
+            ),
+          ),
+          shape: WidgetStatePropertyAll(
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          ),
+          textStyle: WidgetStatePropertyAll(
+            GoogleFonts.robotoCondensed(
+              fontSize: 13,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ),
+        onSelectionChanged: (selection) {
+          setState(() => _modoRegistro = selection.first);
+        },
+      ),
+    );
+  }
+
   Widget _buildHorarioMarcacionesCard() {
+    if (_modoRegistro == _ModoRegistro.tracking) {
+      return _buildTrackingMarcacionesCard();
+    }
+
     final marcaciones = _marcacionesParaHorario(_horarioHoy);
     final completadas = _marcacionesCompletadas(_asistenciaHoy);
     final scheme = Theme.of(context).colorScheme;
@@ -1015,7 +2296,7 @@ class _HomeScreenState extends State<HomeScreen> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Text(
-                'HORARIO Y MARCACIONES',
+                'ASISTENCIA DE HOY',
                 style: GoogleFonts.robotoCondensed(
                   fontSize: 13,
                   color: scheme.onSurface.withValues(alpha: 0.92),
@@ -1058,8 +2339,41 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
           ],
+          if (_cantidadPendientes > 0) ...[
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.only(bottom: 12),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: scheme.secondary.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: scheme.secondary.withValues(alpha: 0.48),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.cloud_upload_outlined, color: scheme.secondary),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _cantidadPendientes == 1
+                          ? '1 marcacion guardada en el equipo, pendiente de sincronizar'
+                          : '$_cantidadPendientes marcaciones guardadas en el equipo, pendientes de sincronizar',
+                      style: GoogleFonts.robotoCondensed(
+                        fontSize: 12,
+                        color: scheme.onSurface,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
           ...marcaciones.map((item) {
             final marcada = _marcaExiste(_asistenciaHoy?[item.$2]);
+            final pendienteSincronizar = _marcasPendientesHoy.contains(item.$2);
             final colorPuntualidad = _calcularColorPuntualidad(item.$2);
 
             return Container(
@@ -1115,10 +2429,16 @@ class _HomeScreenState extends State<HomeScreen> {
                     crossAxisAlignment: CrossAxisAlignment.end,
                     children: [
                       Text(
-                        marcada ? 'Marcado' : 'Pendiente',
+                        pendienteSincronizar
+                            ? 'Por sincronizar'
+                            : marcada
+                            ? 'Marcado'
+                            : 'Pendiente',
                         style: GoogleFonts.robotoCondensed(
                           fontSize: 12,
-                          color: marcada
+                          color: pendienteSincronizar
+                              ? scheme.secondary
+                              : marcada
                               ? colorPuntualidad
                               : scheme.onSurface.withValues(alpha: 0.72),
                           fontWeight: FontWeight.w700,
@@ -1148,41 +2468,166 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildDetalleMarcacion(
-    String nombre,
-    Map<String, dynamic>? data,
-    String key,
-  ) {
+  Widget _buildTrackingMarcacionesCard() {
     final scheme = Theme.of(context).colorScheme;
-    final marcada = _marcaExiste(data?[key]);
-    final colorPuntualidad = marcada
-        ? _calcularColorPuntualidadEn(data, key)
-        : scheme.onSurface.withValues(alpha: 0.38);
+    final tracking = _trackingCombinado(_trackingHoy, _asistenciaHoy);
+    final trackingColor = _colorModo(_ModoRegistro.tracking);
 
     return Container(
-      margin: const EdgeInsets.only(bottom: 6),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: scheme.onSurface.withValues(alpha: 0.06),
+        color: AppTheme.glassSurface(context),
         borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: AppTheme.glassBorder(context)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.24),
+            blurRadius: 18,
+            offset: Offset(0, 10),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'TRACKING DE HOY',
+                style: GoogleFonts.robotoCondensed(
+                  fontSize: 13,
+                  color: scheme.onSurface.withValues(alpha: 0.92),
+                  letterSpacing: 1,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              Text(
+                _contadorTracking(tracking.length),
+                style: GoogleFonts.bebasNeue(
+                  fontSize: 18,
+                  color: tracking.isEmpty
+                      ? scheme.onSurface.withValues(alpha: 0.66)
+                      : trackingColor,
+                  letterSpacing: 1,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          if (tracking.isEmpty)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: scheme.onSurface.withValues(alpha: 0.05),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: AppTheme.glassBorder(context, alpha: 0.16),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.route_outlined,
+                    color: scheme.onSurface.withValues(alpha: 0.52),
+                    size: 22,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      'Sin movimientos de tracking hoy',
+                      style: GoogleFonts.robotoCondensed(
+                        fontSize: 13,
+                        color: scheme.onSurface.withValues(alpha: 0.78),
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            )
+          else ...[
+            ...tracking.asMap().entries.map(
+              (entry) => _buildTrackingMarcaTile(entry.value, entry.key + 1),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTrackingMarcaTile(Map<String, dynamic> registro, int index) {
+    final scheme = Theme.of(context).colorScheme;
+    final trackingColor = _colorTrackingRegistro(registro);
+    final tipo = _tipoTracking(registro);
+    final subtitulo = _subtituloTracking(registro);
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: trackingColor.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: trackingColor.withValues(alpha: 0.62)),
       ),
       child: Row(
         children: [
-          Expanded(
-            child: Text(
-              nombre,
-              style: GoogleFonts.robotoCondensed(
-                fontSize: 12,
-                color: scheme.onSurface.withValues(alpha: 0.7),
-                fontWeight: FontWeight.w700,
+          Container(
+            width: 28,
+            height: 28,
+            decoration: BoxDecoration(
+              color: trackingColor.withValues(alpha: 0.22),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: trackingColor),
+            ),
+            child: Center(
+              child: Text(
+                index.toString(),
+                style: GoogleFonts.bebasNeue(
+                  fontSize: 16,
+                  color: trackingColor,
+                  letterSpacing: 0.5,
+                ),
               ),
             ),
           ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  tipo,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: GoogleFonts.robotoCondensed(
+                    fontSize: 14,
+                    color: scheme.onSurface,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  subtitulo,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: GoogleFonts.robotoCondensed(
+                    fontSize: 11,
+                    color: scheme.onSurface.withValues(alpha: 0.64),
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 10),
           Text(
-            marcada ? _horaMarcada(data, key) : 'Pendiente',
+            _horaTracking(registro),
             style: GoogleFonts.bebasNeue(
-              fontSize: 16,
-              color: colorPuntualidad,
+              fontSize: 20,
+              color: trackingColor,
               letterSpacing: 1,
             ),
           ),
@@ -1195,6 +2640,9 @@ class _HomeScreenState extends State<HomeScreen> {
     final scheme = Theme.of(context).colorScheme;
     final ahora = DateTime.now();
     final datos = _mesSeleccionado == 0 ? _historialActual : _historialAnterior;
+    final trackingDatos = _mesSeleccionado == 0
+        ? _trackingActual
+        : _trackingAnterior;
     final mes = _mesSeleccionado == 0
         ? DateTime(ahora.year, ahora.month)
         : DateTime(ahora.year, ahora.month - 1);
@@ -1205,10 +2653,25 @@ class _HomeScreenState extends State<HomeScreen> {
     final diaInicio = primerDia.weekday;
 
     final diasConAsistencia = <int>{};
+    final diasConEntrada = <int>{};
     for (final reg in datos) {
       final fecha = _fechaRegistro(reg);
       if (fecha != null && fecha.year == mes.year && fecha.month == mes.month) {
         diasConAsistencia.add(fecha.day);
+        if (_marcaExiste(reg['horario_entrada'])) {
+          diasConEntrada.add(fecha.day);
+        }
+      }
+    }
+
+    final diasConTracking = <int>{};
+    for (final reg in trackingDatos) {
+      final fecha = _fechaTracking(reg)?.toLocal();
+      if (fecha != null &&
+          fecha.year == mes.year &&
+          fecha.month == mes.month &&
+          diasConEntrada.contains(fecha.day)) {
+        diasConTracking.add(fecha.day);
       }
     }
 
@@ -1225,6 +2688,10 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       }
     }
+    final trackingDia = _trackingCombinado(
+      _trackingParaDia(trackingDatos, mes, _diaSeleccionado),
+      detallesDia,
+    );
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1319,6 +2786,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
                   final dia = i - diaInicio + 2;
                   final tieneAsistencia = diasConAsistencia.contains(dia);
+                  final tieneTracking = diasConTracking.contains(dia);
+                  final tieneActividad = tieneAsistencia || tieneTracking;
                   final esSeleccionado = _diaSeleccionado == dia;
 
                   return GestureDetector(
@@ -1333,6 +2802,8 @@ class _HomeScreenState extends State<HomeScreen> {
                             ? AppPalette.azulOscuro
                             : tieneAsistencia
                             ? AppPalette.verdeAzulado.withValues(alpha: 0.3)
+                            : tieneTracking
+                            ? AppPalette.celesteClaro.withValues(alpha: 0.22)
                             : scheme.onSurface.withValues(alpha: 0.04),
                         borderRadius: BorderRadius.circular(8),
                         border: Border.all(
@@ -1340,20 +2811,53 @@ class _HomeScreenState extends State<HomeScreen> {
                               ? AppPalette.turquesaBrillante
                               : tieneAsistencia
                               ? AppPalette.verdeAzulado
+                              : tieneTracking
+                              ? AppPalette.celesteClaro
                               : AppTheme.glassBorder(context, alpha: 0.12),
                         ),
                       ),
-                      child: Center(
-                        child: Text(
-                          dia.toString(),
-                          style: GoogleFonts.bebasNeue(
-                            fontSize: 12,
-                            color: tieneAsistencia || esSeleccionado
-                                ? Colors.white
-                                : scheme.onSurface.withValues(alpha: 0.72),
-                            letterSpacing: 0.5,
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Text(
+                            dia.toString(),
+                            style: GoogleFonts.bebasNeue(
+                              fontSize: 12,
+                              color: tieneActividad || esSeleccionado
+                                  ? Colors.white
+                                  : scheme.onSurface.withValues(alpha: 0.72),
+                              letterSpacing: 0.5,
+                            ),
                           ),
-                        ),
+                          if (tieneActividad) ...[
+                            const SizedBox(height: 3),
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (tieneAsistencia)
+                                  Container(
+                                    width: 4,
+                                    height: 4,
+                                    decoration: const BoxDecoration(
+                                      color: AppPalette.turquesaBrillante,
+                                      shape: BoxShape.circle,
+                                    ),
+                                  ),
+                                if (tieneAsistencia && tieneTracking)
+                                  const SizedBox(width: 3),
+                                if (tieneTracking)
+                                  Container(
+                                    width: 4,
+                                    height: 4,
+                                    decoration: const BoxDecoration(
+                                      color: AppPalette.celesteClaro,
+                                      shape: BoxShape.circle,
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ],
+                        ],
                       ),
                     ),
                   );
@@ -1362,7 +2866,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ],
           ),
         ),
-        if (detallesDia != null) ...[
+        if (detallesDia != null || trackingDia.isNotEmpty) ...[
           const SizedBox(height: 16),
           Container(
             width: double.infinity,
@@ -1384,10 +2888,35 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
                 const SizedBox(height: 8),
-                ..._marcacionesParaDetalle(detallesDia).map(
-                  (item) =>
-                      _buildDetalleMarcacion(item.$1, detallesDia, item.$2),
-                ),
+                if (trackingDia.isEmpty)
+                  Container(
+                    width: double.infinity,
+                    margin: const EdgeInsets.only(top: 2),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 9,
+                    ),
+                    decoration: BoxDecoration(
+                      color: scheme.onSurface.withValues(alpha: 0.05),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: AppTheme.glassBorder(context, alpha: 0.14),
+                      ),
+                    ),
+                    child: Text(
+                      'Sin marcaciones registradas',
+                      style: GoogleFonts.robotoCondensed(
+                        fontSize: 12,
+                        color: scheme.onSurface.withValues(alpha: 0.7),
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  )
+                else
+                  ...trackingDia.asMap().entries.map(
+                    (entry) =>
+                        _buildTrackingMarcaTile(entry.value, entry.key + 1),
+                  ),
               ],
             ),
           ),
@@ -1398,6 +2927,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _buildScannerOverlay() {
     final scheme = Theme.of(context).colorScheme;
+    final textoScanner = _modoRegistro == _ModoRegistro.tracking
+        ? 'Apunta al QR de la tienda para tracking'
+        : 'Apunta al QR de la tienda';
 
     return Stack(
       children: [
@@ -1442,7 +2974,7 @@ class _HomeScreenState extends State<HomeScreen> {
           left: 0,
           right: 0,
           child: Text(
-            'Apunta al QR de la tienda',
+            textoScanner,
             textAlign: TextAlign.center,
             style: GoogleFonts.robotoCondensed(
               fontSize: 17,
@@ -1555,11 +3087,27 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  String _textoBotonScanner(bool scannerBloqueado) {
+    if (_modoRegistro == _ModoRegistro.tracking) {
+      return 'ESCANEAR QR DE TRACKING';
+    }
+
+    if (scannerBloqueado) {
+      return 'ESPERA ${_formatearCooldown(_cooldownRestante)}';
+    }
+
+    return 'ESCANEAR QR PARA MARCAR';
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final isDark = theme.brightness == Brightness.dark;
+    final scannerBloqueado =
+        _modoRegistro == _ModoRegistro.asistencia && _enCooldown;
+    final textoBoton = _textoBotonScanner(scannerBloqueado);
+    final colorModo = _colorModo(_modoRegistro);
 
     return Scaffold(
       body: Stack(
@@ -1587,24 +3135,25 @@ class _HomeScreenState extends State<HomeScreen> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
+                          _buildModoRegistroControl(),
+                          const SizedBox(height: 12),
                           ElevatedButton(
-                            onPressed: _enCooldown
+                            onPressed: scannerBloqueado
                                 ? null
-                                : () => setState(() => _escaneando = true),
+                                : _abrirScannerConRequisitos,
                             style: ElevatedButton.styleFrom(
-                              backgroundColor: scheme.primary,
+                              backgroundColor: colorModo,
                               foregroundColor: Colors.white,
-                              disabledBackgroundColor: scheme.primary
-                                  .withValues(alpha: 0.45),
+                              disabledBackgroundColor: colorModo.withValues(
+                                alpha: 0.45,
+                              ),
                               minimumSize: const Size.fromHeight(52),
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(8),
                               ),
                             ),
                             child: Text(
-                              _enCooldown
-                                  ? 'ESPERA ${_formatearCooldown(_cooldownRestante)}'
-                                  : 'ESCANEAR QR PARA MARCAR',
+                              textoBoton,
                               style: GoogleFonts.bebasNeue(
                                 fontSize: 18,
                                 color: Colors.white,
@@ -1612,7 +3161,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               ),
                             ),
                           ),
-                          if (_enCooldown) ...[
+                          if (scannerBloqueado) ...[
                             const SizedBox(height: 10),
                             Text(
                               'Debes esperar ${_formatearCooldown(_cooldownRestante)} antes de volver a marcar.',

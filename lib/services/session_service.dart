@@ -7,6 +7,7 @@ import 'app_logger.dart';
 class SessionService {
   static const String _usuarioKey = 'trabajador_usuario';
   static const String _horarioManualPrefix = 'horario_manual';
+  static const String _horarioDiaPrefix = 'horario_dia';
 
   Future<void> guardarUsuario(Map<String, dynamic> usuario) async {
     try {
@@ -109,8 +110,53 @@ class SessionService {
     }
   }
 
+  Future<void> guardarHorarioDia(
+    String dni,
+    DateTime fecha,
+    Map<String, dynamic> horario,
+  ) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_horarioDiaKey(dni, fecha), jsonEncode(horario));
+    } catch (e, st) {
+      AppLogger.error(
+        'SessionService',
+        'No se pudo guardar el horario del dia',
+        e,
+        st,
+      );
+    }
+  }
+
+  Future<Map<String, dynamic>?> obtenerHorarioDia(
+    String dni,
+    DateTime fecha,
+  ) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_horarioDiaKey(dni, fecha));
+      if (raw == null || raw.trim().isEmpty) {
+        return null;
+      }
+      final decoded = jsonDecode(raw);
+      return decoded is Map ? Map<String, dynamic>.from(decoded) : null;
+    } catch (e, st) {
+      AppLogger.error(
+        'SessionService',
+        'No se pudo restaurar el horario del dia',
+        e,
+        st,
+      );
+      return null;
+    }
+  }
+
   String _horarioManualKey(String dni, DateTime fecha) {
     return '$_horarioManualPrefix:${dni.trim()}:${_fechaKey(fecha)}';
+  }
+
+  String _horarioDiaKey(String dni, DateTime fecha) {
+    return '$_horarioDiaPrefix:${dni.trim()}:${_fechaKey(fecha)}';
   }
 
   String _fechaKey(DateTime fecha) {

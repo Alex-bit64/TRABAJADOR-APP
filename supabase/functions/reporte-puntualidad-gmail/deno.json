@@ -1,0 +1,8 @@
+{
+  "imports": {
+    "@supabase/functions-js/edge-runtime.d.ts": "jsr:@supabase/functions-js@2.110.9/edge-runtime.d.ts",
+    "@supabase/supabase-js": "jsr:@supabase/supabase-js@2.110.9",
+    "nodemailer": "npm:nodemailer@6.10.1"
+  },
+  "nodeModulesDir": "auto"
+}

@@ -1,19 +1,27 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/date_symbol_data_local.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'supabase_options.dart';
 import 'screens/login_screen.dart';
+import 'services/local_database_service.dart';
 import 'theme/app_theme.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+    DeviceOrientation.portraitDown,
+  ]);
 
   // Inicializar Supabase
   await Supabase.initialize(
     url: SupabaseOptions.supabaseUrl,
-    anonKey: SupabaseOptions.supabaseKey,
+    publishableKey: SupabaseOptions.supabaseKey,
   );
+
+  await LocalDatabaseService.instance.inicializar();
 
   await initializeDateFormatting('es');
 

@@ -34,7 +34,13 @@ class AppRequirementsResult {
 
   const AppRequirementsResult(this.statuses);
 
-  bool get ready => statuses.every((item) => item.resolved);
+  bool get ready => statuses
+      .where((item) => item.type != AppRequirementType.internet)
+      .every((item) => item.resolved);
+
+  bool get hasInternet => statuses.any(
+    (item) => item.type == AppRequirementType.internet && item.resolved,
+  );
 
   List<AppRequirementStatus> get pending =>
       statuses.where((item) => !item.resolved).toList();

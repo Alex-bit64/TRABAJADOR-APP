@@ -1,17 +1,37 @@
 workflows:
-  ios-ipa-sin-firma:
-    name: iOS IPA Sin Firma
+  ios-test-build:
+    name: iOS Release Sin Firma
+    max_build_duration: 120
     instance_type: mac_mini_m2
     environment:
       flutter: stable
       xcode: latest
       cocoapods: default
+    cache:
+      cache_paths:
+        - ~/.pub-cache
+        - ~/Library/Caches/CocoaPods
     scripts:
-      - flutter pub get
-      - cd ios && pod install && cd ..
-      - flutter build ios --release --no-codesign
-      - mkdir -p build/ios/ipa/Payload
-      - cp -R build/ios/iphoneos/Runner.app build/ios/ipa/Payload/
-      - cd build/ios/ipa && zip -r Runner-unsigned.ipa Payload
+      - name: Verificar entorno de compilacion
+        script: flutter doctor -v
+
+      - name: Instalar dependencias Flutter
+        script: flutter pub upgrade
+
+      - name: Analizar codigo Dart
+        script: dart analyze lib test
+
+      - name: Ejecutar pruebas
+        script: flutter test
+
+      - name: Actualizar e instalar CocoaPods
+        script: |
+          cd ios
+          pod install --repo-update
+
+      - name: Compilar iOS sin firma
+        script: flutter build ios --release --no-codesign
+
     artifacts:
-      - build/ios/ipa/Runner-unsigned.ipa
+      - build/ios/iphoneos/**/*.app
+      - /tmp/xcodebuild_logs/*.log
