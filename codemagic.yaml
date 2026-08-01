@@ -32,6 +32,14 @@ workflows:
       - name: Compilar iOS sin firma
         script: flutter build ios --release --no-codesign
 
+      - name: Empaquetar IPA sin firma
+        script: |
+          rm -rf build/ios/ipa
+          mkdir -p build/ios/ipa/Payload
+          cp -R build/ios/iphoneos/Runner.app build/ios/ipa/Payload/Runner.app
+          cd build/ios/ipa
+          zip -qry Runner-unsigned.ipa Payload
+
     artifacts:
-      - build/ios/iphoneos/**/*.app
+      - build/ios/ipa/Runner-unsigned.ipa
       - /tmp/xcodebuild_logs/*.log
