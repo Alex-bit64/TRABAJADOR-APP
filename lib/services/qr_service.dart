@@ -4,6 +4,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'app_logger.dart';
+import 'local_database_service.dart';
 
 class QRService {
   Future<QRValidacionResult> validarQR(
@@ -35,6 +36,46 @@ class QRService {
 
       if (_esPayloadDinamico(tokenQR)) {
         final ubicacion = await _obtenerUbicacion();
+        final qrRecord = await _buscarQR(qrData, tokenQR);
+
+        if (qrRecord != null) {
+          final idTiendaQR = qrRecord['id_tienda']?.toString() ?? '';
+          final tiendaInfo = qrRecord['nombre_tienda'] == null
+              ? await _obtenerInfoTienda(idTiendaQR)
+              : null;
+          final nombreTienda =
+              qrRecord['nombre_tienda']?.toString() ??
+              tiendaInfo?['nombre']?.toString() ??
+              'Tienda';
+          final direccion =
+              qrRecord['direccion']?.toString() ??
+              tiendaInfo?['direccion']?.toString() ??
+              '';
+          final ubicacionQr = _normalizarUbicacionQr(qrRecord['ubicacion']);
+
+          AppLogger.info(
+            'QRService',
+            'QR dinamico resuelto para marcacion local',
+            {
+              'id_tienda': AppLogger.shortId(idTiendaQR),
+              'tienda': nombreTienda,
+              'qr_tiene_ubicacion': ubicacionQr.isNotEmpty,
+            },
+          );
+
+          return QRValidacionResult.exito(
+            qrValidado: QRValidado(
+              token: tokenQR,
+              idSede: idTiendaQR,
+              nombreSede: nombreTienda,
+              idTienda: idTiendaQR,
+              nombreTienda: nombreTienda,
+              direccion: direccion,
+              ubicacionQr: ubicacionQr,
+            ),
+            ubicacion: ubicacion,
+          );
+        }
 
         AppLogger.info(
           'QRService',
@@ -50,6 +91,7 @@ class QRService {
             idTienda: '',
             nombreTienda: 'QR de tienda',
             direccion: '',
+            ubicacionQr: const {},
           ),
           ubicacion: ubicacion,
         );
@@ -85,6 +127,7 @@ class QRService {
           qrRecord['direccion']?.toString() ??
           tiendaInfo?['direccion']?.toString() ??
           '';
+      final ubicacionQr = _normalizarUbicacionQr(qrRecord['ubicacion']);
       final ubicacion = await _obtenerUbicacion();
 
       AppLogger.info('QRService', 'QR validado correctamente', {
@@ -92,6 +135,7 @@ class QRService {
         'tienda': nombreTienda,
         'lat': ubicacion['latitude']?.toStringAsFixed(5),
         'lng': ubicacion['longitude']?.toStringAsFixed(5),
+        'qr_tiene_ubicacion': ubicacionQr.isNotEmpty,
       });
 
       return QRValidacionResult.exito(
@@ -102,6 +146,7 @@ class QRService {
           idTienda: idTiendaQR,
           nombreTienda: nombreTienda,
           direccion: direccion,
+          ubicacionQr: ubicacionQr,
         ),
         ubicacion: ubicacion,
       );
@@ -228,6 +273,7 @@ class QRService {
 
       final rpcRecord = await _buscarQRRpc(supabase, tokenQR);
       if (rpcRecord != null) {
+        await LocalDatabaseService.instance.guardarQr(rpcRecord);
         return rpcRecord;
       }
 
@@ -246,7 +292,9 @@ class QRService {
         AppLogger.info('QRService', 'QR encontrado por token', {
           'token': AppLogger.shortId(tokenQR),
         });
-        return Map<String, dynamic>.from(porToken.first);
+        final record = Map<String, dynamic>.from(porToken.first);
+        await LocalDatabaseService.instance.guardarQr(record);
+        return record;
       }
 
       final porTokenNormalizado = await supabase
@@ -259,7 +307,9 @@ class QRService {
         AppLogger.info('QRService', 'QR encontrado por token normalizado', {
           'token': AppLogger.shortId(tokenQR),
         });
-        return Map<String, dynamic>.from(porTokenNormalizado.first);
+        final record = Map<String, dynamic>.from(porTokenNormalizado.first);
+        await LocalDatabaseService.instance.guardarQr(record);
+        return record;
       }
 
       AppLogger.warning('QRService', 'No se encontro QR', {
@@ -271,7 +321,15 @@ class QRService {
       AppLogger.error('QRService', 'Error buscando QR', e, st, {
         'token': AppLogger.shortId(tokenQR),
       });
-      return null;
+      final cached = await LocalDatabaseService.instance.obtenerQr(tokenQR);
+      if (cached != null) {
+        AppLogger.info(
+          'QRService',
+          'Usando QR validado guardado en el equipo',
+          {'token': AppLogger.shortId(tokenQR)},
+        );
+      }
+      return cached;
     }
   }
 
@@ -346,6 +404,36 @@ class QRService {
     }
   }
 
+  Map<String, dynamic> _normalizarUbicacionQr(Object? raw) {
+    if (raw == null) {
+      return <String, dynamic>{};
+    }
+
+    if (raw is Map<String, dynamic>) {
+      return Map<String, dynamic>.from(raw);
+    }
+
+    if (raw is Map) {
+      return Map<String, dynamic>.from(raw);
+    }
+
+    if (raw is String && raw.trim().isNotEmpty) {
+      try {
+        final parsed = jsonDecode(raw);
+        if (parsed is Map<String, dynamic>) {
+          return Map<String, dynamic>.from(parsed);
+        }
+        if (parsed is Map) {
+          return Map<String, dynamic>.from(parsed);
+        }
+      } catch (_) {
+        AppLogger.warning('QRService', 'Ubicacion QR no es JSON valido');
+      }
+    }
+
+    return <String, dynamic>{};
+  }
+
   Map<String, dynamic>? _firstRow(Object? response) {
     if (response is List && response.isNotEmpty) {
       final first = response.first;
@@ -418,13 +506,15 @@ class QRService {
       AppLogger.error('QRService', 'Detalle error ubicacion actual', e, st);
       final posicion = await Geolocator.getLastKnownPosition();
       AppLogger.info('QRService', 'Usando ultima ubicacion conocida', {
-        'lat': posicion?.latitude.toStringAsFixed(5) ?? '0',
-        'lng': posicion?.longitude.toStringAsFixed(5) ?? '0',
+        'lat': posicion?.latitude.toStringAsFixed(5) ?? 'sin_ubicacion',
+        'lng': posicion?.longitude.toStringAsFixed(5) ?? 'sin_ubicacion',
       });
-      return {
-        'latitude': posicion?.latitude ?? 0,
-        'longitude': posicion?.longitude ?? 0,
-      };
+      if (posicion == null) {
+        throw Exception(
+          'No se pudo obtener tu ubicacion. Intenta nuevamente con el GPS activo.',
+        );
+      }
+      return {'latitude': posicion.latitude, 'longitude': posicion.longitude};
     }
   }
 }
@@ -465,6 +555,7 @@ class QRValidado {
   final String idTienda;
   final String nombreTienda;
   final String direccion;
+  final Map<String, dynamic> ubicacionQr;
 
   const QRValidado({
     required this.token,
@@ -473,5 +564,33 @@ class QRValidado {
     required this.idTienda,
     required this.nombreTienda,
     required this.direccion,
+    this.ubicacionQr = const {},
   });
+
+  factory QRValidado.fromMap(Map<String, dynamic> data) {
+    final ubicacion = data['ubicacion_qr'];
+    return QRValidado(
+      token: data['token']?.toString() ?? '',
+      idSede: data['id_sede']?.toString() ?? '',
+      nombreSede: data['nombre_sede']?.toString() ?? '',
+      idTienda: data['id_tienda']?.toString() ?? '',
+      nombreTienda: data['nombre_tienda']?.toString() ?? 'Tienda',
+      direccion: data['direccion']?.toString() ?? '',
+      ubicacionQr: ubicacion is Map
+          ? Map<String, dynamic>.from(ubicacion)
+          : const <String, dynamic>{},
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'token': token,
+      'id_sede': idSede,
+      'nombre_sede': nombreSede,
+      'id_tienda': idTienda,
+      'nombre_tienda': nombreTienda,
+      'direccion': direccion,
+      'ubicacion_qr': ubicacionQr,
+    };
+  }
 }

@@ -2,8 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import '../services/app_logger.dart';
+import '../services/app_version_service.dart';
+import '../services/device_security_service.dart';
 import '../services/session_service.dart';
 import '../services/supabase_service.dart';
+import '../services/top_message_service.dart';
 import '../theme/app_theme.dart';
 import 'app_requirements_screen.dart';
 
@@ -27,6 +30,8 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _mostrarPassword = false;
   bool _cargando = false;
   bool _assetsPrecargados = false;
+  final _supabaseService = SupabaseService();
+  final _deviceSecurity = DeviceSecurityService();
 
   @override
   void initState() {
@@ -47,6 +52,59 @@ class _LoginScreenState extends State<LoginScreen> {
     AppLogger.info('Login', 'Sesion guardada restaurada', {
       'dni': AppLogger.shortId(usuario['dni']?.toString() ?? ''),
     });
+
+    final dni = usuario['dni']?.toString() ?? '';
+    try {
+      final vinculadoLocal = await _deviceSecurity.estaVinculadoLocalmente(dni);
+      if (!vinculadoLocal) {
+        await SessionService().cerrarSesion();
+        _mostrarErrorDespuesDelPrimerFrame(
+          'Inicia sesion nuevamente para vincular este celular con tu biometria.',
+        );
+        return;
+      }
+
+      final credenciales = await _deviceSecurity.obtenerCredenciales(
+        crearSiFaltan: false,
+      );
+      try {
+        final valido = await _supabaseService.validarDispositivo(
+          dni: dni,
+          credentials: credenciales,
+        );
+        if (!valido) {
+          await SessionService().cerrarSesion();
+          _mostrarErrorDespuesDelPrimerFrame(
+            'Este celular ya no esta autorizado. Inicia sesion para volver a validarlo.',
+          );
+          return;
+        }
+      } catch (e) {
+        if (!_supabaseService.esErrorConexion(e)) {
+          rethrow;
+        }
+        AppLogger.warning(
+          'Login',
+          'Se restaura la sesion con validacion local por falta de internet',
+          {'dni': AppLogger.shortId(dni)},
+        );
+      }
+    } catch (e, st) {
+      AppLogger.error(
+        'Login',
+        'No se pudo restaurar el vinculo del dispositivo',
+        e,
+        st,
+        {'dni': AppLogger.shortId(dni)},
+      );
+      await SessionService().cerrarSesion();
+      _mostrarErrorDespuesDelPrimerFrame(
+        'No se pudo validar este celular. Inicia sesion nuevamente.',
+      );
+      return;
+    }
+
+    AppVersionService().registrarParaUsuario(usuario);
 
     _abrirRequisitos(usuario);
   }
@@ -92,7 +150,7 @@ class _LoginScreenState extends State<LoginScreen> {
     setState(() => _cargando = true);
 
     try {
-      final usuario = await SupabaseService().buscarUsuarioPorCredenciales(
+      final usuario = await _supabaseService.buscarUsuarioPorCredenciales(
         identificador,
         password,
       );
@@ -114,13 +172,38 @@ class _LoginScreenState extends State<LoginScreen> {
         'id_tienda': AppLogger.shortId(usuario['id_tienda']?.toString() ?? ''),
       });
 
+      await _deviceSecurity.autenticar(
+        motivo:
+            'Confirma tu identidad para vincular este celular con tu cuenta de asistencia.',
+      );
+      final credenciales = await _deviceSecurity.obtenerCredenciales();
+      final vinculacion = await _supabaseService.vincularDispositivo(
+        identificador: identificador,
+        password: password,
+        credentials: credenciales,
+      );
+      if (!vinculacion.ok) {
+        _mostrarError(vinculacion.message);
+        return;
+      }
+      final dni = usuario['dni']?.toString() ?? '';
+      await _deviceSecurity.guardarDniVinculado(dni);
+
       await SessionService().guardarUsuario(usuario);
+      await AppVersionService().registrarParaUsuario(usuario);
 
       if (!mounted) {
         return;
       }
 
       _abrirRequisitos(usuario);
+    } on DeviceSecurityException catch (e, st) {
+      AppLogger.error('Login', 'Validacion biometrica rechazada', e, st, {
+        'identificador': _maskIdentificador(identificador),
+      });
+      if (mounted) {
+        _mostrarError(e.message);
+      }
     } catch (e, st) {
       AppLogger.error('Login', 'Error durante login', e, st, {
         'identificador': _maskIdentificador(identificador),
@@ -142,9 +225,15 @@ class _LoginScreenState extends State<LoginScreen> {
       return;
     }
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(mensaje), backgroundColor: AppPalette.error),
-    );
+    TopMessageService.show(context, mensaje, isError: true);
+  }
+
+  void _mostrarErrorDespuesDelPrimerFrame(String mensaje) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _mostrarError(mensaje);
+      }
+    });
   }
 
   void _abrirRequisitos(Map<String, dynamic> usuario) {

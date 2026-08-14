@@ -96,7 +96,7 @@
 	<string>Necesario para validar tu ubicacion al registrar asistencia</string>
 
 	<key>NSFaceIDUsageDescription</key>
-	<string>Necesario para verificar tu identidad</string>
+	<string>Necesario para verificar tu identidad antes de registrar asistencia</string>
 
 </dict>
 </plist>

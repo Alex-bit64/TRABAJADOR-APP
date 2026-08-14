@@ -146,7 +146,7 @@ class _AppRequirementsScreenState extends State<AppRequirementsScreen>
                         ),
                         const SizedBox(height: 8),
                         Text(
-                          'Antes de entrar al menu principal necesitamos internet, GPS y camara activos.',
+                          'GPS y camara son obligatorios. Sin internet puedes usar datos guardados y dejar marcas pendientes de sincronizar.',
                           textAlign: TextAlign.center,
                           style: GoogleFonts.robotoCondensed(
                             fontSize: 14,
