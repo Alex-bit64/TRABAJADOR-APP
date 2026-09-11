@@ -36,51 +36,52 @@ class DeviceSecurityService {
 
   Future<void> autenticar({required String motivo}) async {
     try {
-      final disponibles = await _localAuthentication.getAvailableBiometrics();
-      if (disponibles.isEmpty) {
-        throw const DeviceSecurityException(
-          'Este celular no tiene una huella o biometria configurada. Registrala en los ajustes del dispositivo.',
+      // isDeviceSupported incluye tanto biometria como la credencial local del
+      // telefono (PIN, patron o contrasena). Si no existe ninguna, el flujo de
+      // marcacion puede continuar sin autenticacion local.
+      final tieneProteccionLocal = await _localAuthentication
+          .isDeviceSupported();
+      if (!tieneProteccionLocal) {
+        AppLogger.warning(
+          'DeviceSecurity',
+          'Dispositivo sin biometria ni credencial local; se continua sin reto',
         );
+        return;
       }
 
       final autenticado = await _localAuthentication.authenticate(
         localizedReason: motivo,
-        biometricOnly: true,
+        // Permite huella/rostro y, si no estan disponibles, el PIN, patron o
+        // contrasena configurados en Android.
+        biometricOnly: false,
         persistAcrossBackgrounding: true,
       );
       if (!autenticado) {
         throw const DeviceSecurityException(
-          'La validacion biometrica fue cancelada o no pudo confirmarse.',
+          'La validacion del dispositivo fue cancelada o no pudo confirmarse.',
         );
       }
     } on DeviceSecurityException {
       rethrow;
     } on LocalAuthException catch (e, st) {
-      AppLogger.error(
-        'DeviceSecurity',
-        'Error de autenticacion biometrica',
-        e,
-        st,
-        {'code': e.code.name},
-      );
-      if (e.code == LocalAuthExceptionCode.noBiometricHardware) {
-        throw const DeviceSecurityException(
-          'Este celular no cuenta con biometria compatible.',
+      AppLogger.error('DeviceSecurity', 'Error de autenticacion local', e, st, {
+        'code': e.code.name,
+      });
+      if (e.code == LocalAuthExceptionCode.noCredentialsSet) {
+        AppLogger.warning(
+          'DeviceSecurity',
+          'El sistema confirmo que no hay credenciales locales; se continua sin reto',
         );
-      }
-      if (e.code == LocalAuthExceptionCode.noBiometricsEnrolled) {
-        throw const DeviceSecurityException(
-          'Primero registra una huella o biometria en los ajustes del celular.',
-        );
+        return;
       }
       if (e.code == LocalAuthExceptionCode.temporaryLockout ||
           e.code == LocalAuthExceptionCode.biometricLockout) {
         throw const DeviceSecurityException(
-          'La biometria esta bloqueada por varios intentos. Desbloquea el celular e intenta nuevamente.',
+          'La validacion esta bloqueada por varios intentos. Desbloquea el celular con tu patron, PIN o contrasena e intenta nuevamente.',
         );
       }
       throw const DeviceSecurityException(
-        'No se pudo validar la biometria del dispositivo.',
+        'No se pudo validar la huella, rostro, patron, PIN o contrasena del dispositivo.',
       );
     } catch (e, st) {
       AppLogger.error(
@@ -90,7 +91,7 @@ class DeviceSecurityService {
         st,
       );
       throw const DeviceSecurityException(
-        'No se pudo iniciar la validacion biometrica.',
+        'No se pudo iniciar la validacion del dispositivo.',
       );
     }
   }

@@ -1,10 +1,10 @@
 workflows:
   ios-test-build:
     name: iOS Test Build Sin Firma
-    max_build_duration: 60
+    max_build_duration: 120
     instance_type: mac_mini_m2
     environment:
-      flutter: stable
+      flutter: 3.41.9
       xcode: latest
       cocoapods: default
     scripts:
@@ -12,7 +12,13 @@ workflows:
         script: flutter doctor
 
       - name: Instalar dependencias Flutter
-        script: flutter pub get
+        script: flutter pub get --enforce-lockfile
+
+      - name: Analizar codigo
+        script: flutter analyze
+
+      - name: Ejecutar pruebas
+        script: flutter test
 
       - name: Instalar CocoaPods
         script: |
@@ -25,3 +31,4 @@ workflows:
 
     artifacts:
       - build/ios/iphoneos/Runner.app
+      - /tmp/xcodebuild_logs/*.log

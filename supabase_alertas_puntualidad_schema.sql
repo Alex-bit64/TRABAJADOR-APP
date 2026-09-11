@@ -99,53 +99,47 @@ CREATE INDEX idx_alerta_log_trabajadores_gin
     ON public.alerta_puntualidad_log
     USING GIN (trabajadores);
 
--- Programacion automatica dinamica.
--- El cron consulta cada minuto y la Edge Function decide que filas estan
--- dentro de la hora_envio + ventana_minutos configuradas en la tabla.
+-- Programacion automatica.
+-- Supabase pg_cron trabaja normalmente en UTC. Peru es UTC-5:
+-- 08:30 Peru = 13:30 UTC
+-- 13:30 Peru = 18:30 UTC
 CREATE EXTENSION IF NOT EXISTS pg_cron WITH SCHEMA extensions;
 CREATE EXTENSION IF NOT EXISTS pg_net WITH SCHEMA extensions;
 
 DO $$
-DECLARE
-    nombre_job TEXT;
 BEGIN
-    FOREACH nombre_job IN ARRAY ARRAY[
-        'reporte-no-marcados-contabilidad-0830',
-        'alertas-puntualidad-cada-5-min',
-        'reporte-tiendas-0830',
-        'reporte-tiendas-1330',
-        'reporte-puntualidad-dinamico'
-    ]
-    LOOP
-        BEGIN
-            PERFORM cron.unschedule(nombre_job);
-        EXCEPTION WHEN OTHERS THEN
-            NULL;
-        END;
-    END LOOP;
+    PERFORM cron.unschedule('reporte-tiendas-0830');
+EXCEPTION WHEN OTHERS THEN
+    NULL;
 END $$;
 
--- Antes de programar el job debe existir en Vault un secreto llamado
--- reporte_puntualidad_cron_secret con el mismo valor de CRON_SECRET
--- configurado en la Edge Function.
+DO $$
+BEGIN
+    PERFORM cron.unschedule('reporte-tiendas-1330');
+EXCEPTION WHEN OTHERS THEN
+    NULL;
+END $$;
+
 SELECT cron.schedule(
-    'reporte-puntualidad-dinamico',
-    '* * * * *',
+    'reporte-tiendas-0830',
+    '30 13 * * *',
     $$
     SELECT net.http_post(
         url := 'https://tlmsnenvqqblmmtimung.supabase.co/functions/v1/reporte-puntualidad-gmail',
-        headers := jsonb_build_object(
-            'Content-Type', 'application/json',
-            'x-cron-secret', (
-                SELECT decrypted_secret
-                FROM vault.decrypted_secrets
-                WHERE name = 'reporte_puntualidad_cron_secret'
-                ORDER BY created_at DESC
-                LIMIT 1
-            )
-        ),
-        body := jsonb_build_object('trigger', 'cron'),
-        timeout_milliseconds := 60000
+        headers := '{"Content-Type":"application/json"}'::JSONB,
+        body := '{"trigger":"cron","hora_envio":"08:30:00"}'::JSONB
+    );
+    $$
+);
+
+SELECT cron.schedule(
+    'reporte-tiendas-1330',
+    '30 18 * * *',
+    $$
+    SELECT net.http_post(
+        url := 'https://tlmsnenvqqblmmtimung.supabase.co/functions/v1/reporte-puntualidad-gmail',
+        headers := '{"Content-Type":"application/json"}'::JSONB,
+        body := '{"trigger":"cron","hora_envio":"13:30:00"}'::JSONB
     );
     $$
 );

@@ -1,4 +1,4 @@
-# trabajador_app
+# Marcador de Asistencias
 
 Aplicación Flutter para registro de trabajadores con login, modo claro/oscuro y gestión de asistencia mediante QR.
 
@@ -25,9 +25,10 @@ Este proyecto es una app móvil de trabajador que incluye:
 
 ## Requisitos
 
-- Flutter 3.0+ / Flutter 4.0+ compatible.
+- Flutter 3.41.9 y Dart 3.11.5.
 - Android SDK instalado y configurado.
-- Xcode instalado para iOS (opcional).
+- macOS, Xcode y CocoaPods para compilar iOS localmente. GitHub Actions y
+  Codemagic también validan la compilación iOS sin firma.
 - Cuenta y proyecto en Supabase con las funciones RPC usadas en el repositorio.
 
 ## Ejecución
@@ -35,19 +36,30 @@ Este proyecto es una app móvil de trabajador que incluye:
 Desde la raíz del proyecto:
 
 ```bash
-flutter pub get
+flutter pub get --enforce-lockfile
+flutter analyze
+flutter test
 flutter run
 ```
 
 Para generar APK de Android:
 
 ```bash
-flutter build apk
+flutter build apk --release
 ```
+
+Para comprobar iOS en macOS sin certificados de distribución:
+
+```bash
+flutter build ios --release --no-codesign
+```
+
+La instalación en un iPhone o publicación en App Store requiere una cuenta de
+Apple Developer, un identificador definitivo de la app y firma válida.
 
 ## Personalización
 
-- Para cambiar el bootón de modo oscuro / claro, ajusta `lib/screens/login_screen.dart`.
+- Para cambiar el botón de modo oscuro/claro, ajusta `lib/screens/login_screen.dart`.
 - Para modificar colores o tipografías, revisa `lib/theme/app_theme.dart`.
 - Si quieres adaptar el backend, revisa `supabase_horario_rpc.sql`, `supabase_login_rpc.sql` y `supabase_qr_asistencia_rpc.sql`.
 
@@ -89,7 +101,10 @@ se actualizará el registro del trabajador.
 - En el primer inicio de sesión la contraseña y una validación biométrica
   vinculan el trabajador con ese celular.
 - Después de validar cada QR de asistencia, Android/iOS muestra su diálogo
-  biométrico. No se permite usar PIN o patrón como reemplazo.
+  de seguridad. Usa rostro o huella cuando están disponibles y permite el
+  patrón, PIN o código configurado en el sistema como alternativa.
+- Si el teléfono no tiene ningún bloqueo local configurado, la app permite
+  continuar con el registro de acuerdo con la regla funcional actual.
 - Supabase solo recibe un UUID aleatorio del dispositivo y el hash de un secreto
   local. El sistema operativo nunca entrega a la app la imagen o plantilla de
   la huella.
@@ -109,4 +124,3 @@ WHERE dni = 'DNI';
 ## Licencia
 
 Este repositorio es de uso personal y puede adaptarse según tu proyecto.
-

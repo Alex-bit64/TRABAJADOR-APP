@@ -32,7 +32,18 @@ migrate_working_dir/
 .pub/
 /build/
 /coverage/
-**/node_modules/
+
+# Generated platform configuration
+/ios/Flutter/Generated.xcconfig
+/ios/Flutter/flutter_export_environment.sh
+/ios/Flutter/ephemeral/
+
+# Local editor settings and packaged artifacts
+/.vscode/
+*.apk
+*.aab
+*.ipa
+*.zip
 
 # Symbolication related
 app.*.symbols
