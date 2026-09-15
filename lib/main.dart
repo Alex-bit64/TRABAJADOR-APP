@@ -5,6 +5,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'supabase_options.dart';
 import 'screens/login_screen.dart';
+import 'screens/app_update_gate.dart';
 import 'services/local_database_service.dart';
 import 'theme/app_theme.dart';
 
@@ -54,7 +55,9 @@ class _AppTrabajadorState extends State<AppTrabajador> {
       themeMode: _themeMode,
       theme: AppTheme.light(),
       darkTheme: AppTheme.dark(),
-      home: LoginScreen(themeMode: _themeMode, onThemeToggle: _toggleTheme),
+      home: AppUpdateGate(
+        child: LoginScreen(themeMode: _themeMode, onThemeToggle: _toggleTheme),
+      ),
     );
   }
 }

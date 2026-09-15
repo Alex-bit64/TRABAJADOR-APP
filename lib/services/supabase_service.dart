@@ -101,6 +101,34 @@ class SupabaseService {
     }
   }
 
+  Future<Map<String, dynamic>?> obtenerVersionTrabajadorApp(
+    String plataforma,
+  ) async {
+    final plataformaLimpia = plataforma.trim().toLowerCase();
+    if (plataformaLimpia.isEmpty) {
+      return null;
+    }
+
+    try {
+      final response = await _db
+          .rpc(
+            'obtener_version_trabajador_app',
+            params: {'p_plataforma': plataformaLimpia},
+          )
+          .timeout(const Duration(seconds: 8));
+      return _firstRow(response);
+    } catch (e, st) {
+      AppLogger.error(
+        'SupabaseService',
+        'No se pudo consultar la version publicada del Marcador',
+        e,
+        st,
+        {'plataforma': plataformaLimpia},
+      );
+      return null;
+    }
+  }
+
   Future<DeviceBindingResult> vincularDispositivo({
     required String identificador,
     required String password,
