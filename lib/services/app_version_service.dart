@@ -11,6 +11,7 @@ class AppReleaseInfo {
   final Uri downloadUrl;
   final String message;
   final bool mandatory;
+  final String sha256;
 
   const AppReleaseInfo({
     required this.version,
@@ -18,6 +19,7 @@ class AppReleaseInfo {
     required this.downloadUrl,
     required this.message,
     required this.mandatory,
+    this.sha256 = '',
   });
 }
 
@@ -34,7 +36,9 @@ class AppVersionService {
 
   Future<AppReleaseInfo?> verificarActualizacion() async {
     try {
-      final info = await PackageInfo.fromPlatform();
+      final info = await PackageInfo.fromPlatform().timeout(
+        const Duration(seconds: 5),
+      );
       final buildInstalado = int.tryParse(info.buildNumber.trim()) ?? 0;
       final data = await _supabaseService.obtenerVersionTrabajadorApp(
         Platform.operatingSystem,
@@ -54,7 +58,7 @@ class AppVersionService {
       }
 
       final url = Uri.tryParse(data['url_descarga']?.toString().trim() ?? '');
-      if (url == null || url.scheme != 'https') {
+      if (url == null || url.scheme != 'https' || url.host.isEmpty) {
         AppLogger.warning(
           'AppVersionService',
           'La version publicada no tiene una URL HTTPS valida',
@@ -71,6 +75,7 @@ class AppVersionService {
             data['mensaje']?.toString().trim() ??
             'Hay una nueva version del Marcador disponible.',
         mandatory: data['obligatoria'] != false,
+        sha256: data['sha256']?.toString().trim().toLowerCase() ?? '',
       );
     } catch (e, st) {
       AppLogger.error(

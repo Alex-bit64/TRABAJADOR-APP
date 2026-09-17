@@ -78,6 +78,20 @@ Apple Developer, un identificador definitivo de la app y firma válida.
   Equipos anteriores al sistema de actualización necesitan una instalación
   manual inicial; la app no puede instalar un APK remotamente.
 
+## Cambios de la versión 1.2.2
+
+- Actualización Android dentro de la app: descarga con progreso, cancelación,
+  límite de inactividad y reintento, sin depender del gestor del navegador.
+- El APK parcial nunca se instala: se comprueba longitud y SHA-256 publicado.
+  Android valida además identificador, build y firma antes de abrir el instalador.
+- Se conserva el APK verificado al regresar de “Permitir desde esta fuente”
+  o al cancelar el instalador; no se descarga otra vez innecesariamente.
+- Los temporales de versiones anteriores se limpian para no acumular APKs.
+- La consulta inicial de versión tiene un tiempo máximo. Hay enlace alternativo
+  y opción de copiarlo si el dispositivo impide la instalación desde el Marcador.
+- Instalar 1.2.2 desde 1.2.0/1.2.1 requiere completar una última descarga externa,
+  porque esas versiones aún no contienen el nuevo descargador.
+
 ## Notas
 
 - El login ahora utiliza un panel blanco/crema con texto oscuro en modo claro.
