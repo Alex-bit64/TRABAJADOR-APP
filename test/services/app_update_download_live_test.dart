@@ -32,8 +32,9 @@ void main() {
             sha256: digest!,
           ),
           onProgress: (progress) {
-            if (progress.phase == UpdateDownloadPhase.verifying)
+            if (progress.phase == UpdateDownloadPhase.verifying) {
               verified = true;
+            }
           },
         );
         expect(verified, isTrue);
