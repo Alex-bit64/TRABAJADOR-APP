@@ -151,6 +151,11 @@ class SessionService {
     }
   }
 
+  Future<void> eliminarHorarioDia(String dni, DateTime fecha) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_horarioDiaKey(dni, fecha));
+  }
+
   String _horarioManualKey(String dni, DateTime fecha) {
     return '$_horarioManualPrefix:${dni.trim()}:${_fechaKey(fecha)}';
   }

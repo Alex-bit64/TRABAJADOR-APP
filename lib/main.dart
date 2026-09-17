@@ -7,6 +7,7 @@ import 'supabase_options.dart';
 import 'screens/login_screen.dart';
 import 'screens/app_update_gate.dart';
 import 'services/local_database_service.dart';
+import 'services/theme_preference_service.dart';
 import 'theme/app_theme.dart';
 
 void main() async {
@@ -26,25 +27,35 @@ void main() async {
 
   await initializeDateFormatting('es');
 
-  runApp(const AppTrabajador());
+  final themeMode = await ThemePreferenceService().cargar();
+  runApp(AppTrabajador(initialThemeMode: themeMode));
 }
 
 class AppTrabajador extends StatefulWidget {
-  const AppTrabajador({super.key});
+  final ThemeMode initialThemeMode;
+
+  const AppTrabajador({super.key, this.initialThemeMode = ThemeMode.dark});
 
   @override
   State<AppTrabajador> createState() => _AppTrabajadorState();
 }
 
 class _AppTrabajadorState extends State<AppTrabajador> {
-  ThemeMode _themeMode = ThemeMode.dark;
+  late ThemeMode _themeMode;
 
-  void _toggleTheme() {
+  @override
+  void initState() {
+    super.initState();
+    _themeMode = widget.initialThemeMode;
+  }
+
+  Future<void> _toggleTheme() async {
     setState(() {
       _themeMode = _themeMode == ThemeMode.dark
           ? ThemeMode.light
           : ThemeMode.dark;
     });
+    await ThemePreferenceService().guardar(_themeMode);
   }
 
   @override

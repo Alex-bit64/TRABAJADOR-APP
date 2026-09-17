@@ -11,6 +11,7 @@ import 'package:uuid/uuid.dart';
 import '../services/app_requirements_service.dart';
 import '../services/app_logger.dart';
 import '../services/device_security_service.dart';
+import '../services/horario_dia_service.dart';
 import '../services/local_database_service.dart';
 import '../services/qr_service.dart';
 import '../services/session_service.dart';
@@ -76,6 +77,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Map<String, dynamic>? _asistenciaHoy;
   Map<String, dynamic>? _horarioHoy;
+  bool _cargandoHorario = true;
+  bool _horarioConfirmado = false;
+  bool _cargandoDatos = false;
+  bool _reintentandoHorario = false;
+  DateTime? _fechaHorario;
   List<Map<String, dynamic>> _historialActual = [];
   List<Map<String, dynamic>> _historialAnterior = [];
   List<Map<String, dynamic>> _trackingHoy = [];
@@ -148,6 +154,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _verificarRequisitosContinuos();
+      unawaited(_reintentarHorario());
     }
   }
 
@@ -182,6 +189,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
       if (requisitos.hasInternet) {
         unawaited(_sincronizarMarcacionesPendientes());
+        if (!_horarioConfirmado || !_horarioEsDeHoy) {
+          unawaited(_reintentarHorario());
+        }
       }
       if (requisitos.ready) {
         return;
@@ -201,28 +211,40 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _cargarDatos() async {
-    AppLogger.info('Home', 'Carga de datos iniciada', {
-      'dni': AppLogger.shortId(_dni),
-    });
+    if (_cargandoDatos || !mounted) return;
+    _cargandoDatos = true;
+    try {
+      AppLogger.info('Home', 'Carga de datos iniciada', {
+        'dni': AppLogger.shortId(_dni),
+      });
 
-    await _cargarPendientes();
-    await Future.wait([
-      _cargarAsistencia(),
-      _cargarHorario(),
-      _cargarHistorial(),
-      _cargarTracking(),
-    ]);
+      await Future.wait([
+        _cargarHorario(),
+        () async {
+          await _cargarPendientes();
+          await Future.wait([
+            _cargarAsistencia(),
+            _cargarHistorial(),
+            _cargarTracking(),
+          ]);
+        }(),
+      ]);
 
-    await _sincronizarAsistenciaConTracking();
-    if (_hayInternet) {
-      await _sincronizarMarcacionesPendientes();
+      await _sincronizarAsistenciaConTracking();
+      if (_hayInternet) {
+        await _sincronizarMarcacionesPendientes();
+      }
+
+      AppLogger.info('Home', 'Carga de datos finalizada', {
+        'dni': AppLogger.shortId(_dni),
+      });
+
+      await _verificarHorarioDelDia();
+    } catch (e, st) {
+      AppLogger.error('Home', 'No se pudo completar la carga de datos', e, st);
+    } finally {
+      _cargandoDatos = false;
     }
-
-    AppLogger.info('Home', 'Carga de datos finalizada', {
-      'dni': AppLogger.shortId(_dni),
-    });
-
-    await _verificarHorarioDelDia();
   }
 
   Future<void> _cargarAsistencia() async {
@@ -262,46 +284,88 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
 
-    final diasSemana = [
-      'lunes',
-      'martes',
-      'miercoles',
-      'jueves',
-      'viernes',
-      'sabado',
-      'domingo',
-    ];
-    final diaHoy = diasSemana[DateTime.now().weekday - 1];
     final ahora = DateTime.now();
-    final horarioRemoto = await _supabaseService.obtenerHorarioTrabajador(
-      _dni,
-      diaSemana: diaHoy,
-    );
-    if (horarioRemoto != null) {
-      await SessionService().guardarHorarioDia(_dni, ahora, horarioRemoto);
-    }
-    final horarioGuardado = horarioRemoto == null
-        ? await SessionService().obtenerHorarioDia(_dni, ahora)
-        : null;
-    final horarioAsignado = horarioRemoto ?? horarioGuardado;
-    final horarioManual = horarioAsignado == null
-        ? await SessionService().obtenerHorarioManual(_dni, ahora)
-        : null;
-    final horarioVisible = horarioAsignado ?? horarioManual;
-
-    AppLogger.info('Home', 'Horario cargado', {
-      'dni': AppLogger.shortId(_dni),
-      'dia': diaHoy,
-      'existe': horarioVisible != null,
-      'cache': horarioRemoto == null && horarioGuardado != null,
-    });
+    final diaHoy = HorarioDiaService.diaSemana(ahora);
+    final session = SessionService();
     if (mounted) {
-      setState(() => _horarioHoy = horarioVisible);
+      setState(() {
+        if (!_horarioEsDeHoy) _horarioHoy = null;
+        _fechaHorario = DateTime(ahora.year, ahora.month, ahora.day);
+        _cargandoHorario = true;
+        _horarioConfirmado = false;
+      });
+    }
+    final resultado =
+        await HorarioDiaService(
+          consultar: () => _supabaseService.obtenerHorarioTrabajador(
+            _dni,
+            diaSemana: diaHoy,
+            propagarError: true,
+          ),
+          leerCache: () => session.obtenerHorarioDia(_dni, ahora),
+          guardarCache: (horario) =>
+              session.guardarHorarioDia(_dni, ahora, horario),
+          limpiarCache: () => session.eliminarHorarioDia(_dni, ahora),
+        ).cargar(
+          alLeerCache: (horario) {
+            if (mounted) setState(() => _horarioHoy = horario);
+          },
+        );
+    Map<String, dynamic>? manual;
+    if (resultado.horario == null) {
+      try {
+        manual = await session.obtenerHorarioManual(_dni, ahora);
+      } catch (e, st) {
+        AppLogger.error('Home', 'No se pudo leer la jornada guardada', e, st);
+      }
+    }
+    if (mounted) {
+      setState(() {
+        _horarioHoy = resultado.horario ?? manual;
+        _horarioConfirmado = resultado.confirmado;
+        _cargandoHorario = false;
+      });
+    }
+  }
+
+  bool get _horarioEsDeHoy {
+    final ahora = DateTime.now();
+    return _fechaHorario?.year == ahora.year &&
+        _fechaHorario?.month == ahora.month &&
+        _fechaHorario?.day == ahora.day;
+  }
+
+  Future<void> _reintentarHorario() async {
+    if (!mounted ||
+        _cargandoDatos ||
+        _reintentandoHorario ||
+        _cargandoHorario ||
+        _selectorJornadaAbierto ||
+        _procesando) {
+      return;
+    }
+    _reintentandoHorario = true;
+    try {
+      final cambioDeDia = !_horarioEsDeHoy;
+      await _cargarHorario();
+      if (cambioDeDia) {
+        await _cargarPendientes();
+        await _cargarAsistencia();
+      }
+      await _verificarHorarioDelDia();
+    } catch (e, st) {
+      AppLogger.error('Home', 'No se pudo refrescar el horario', e, st);
+    } finally {
+      _reintentandoHorario = false;
     }
   }
 
   Future<void> _verificarHorarioDelDia() async {
-    if (!mounted || _dni.isEmpty) {
+    if (!mounted ||
+        _dni.isEmpty ||
+        _cargandoHorario ||
+        !_horarioConfirmado ||
+        !_horarioEsDeHoy) {
       return;
     }
 
@@ -648,6 +712,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _procesarQR(String qrValue) async {
+    if (_modoRegistro == _ModoRegistro.asistencia &&
+        (!_horarioEsDeHoy || _horarioHoy == null)) {
+      _mostrarMensaje(
+        _cargandoHorario
+            ? 'Espera mientras se carga tu horario.'
+            : 'Verifica tu horario antes de marcar. Pulsa Reintentar.',
+        esError: true,
+      );
+      unawaited(_reintentarHorario());
+      return;
+    }
     final bloqueadoPorCooldown =
         _modoRegistro == _ModoRegistro.asistencia && _enCooldown;
     if (_procesando || _qrProcesado || bloqueadoPorCooldown) {
@@ -1204,6 +1279,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       backgroundColor: Colors.transparent,
       builder: (sheetContext) {
         String? seleccion = 'fulltime';
+        bool consultando = false;
+        String? estadoConsulta;
         final scheme = Theme.of(sheetContext).colorScheme;
 
         return StatefulBuilder(
@@ -1241,6 +1318,38 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       ),
                     ),
                     const SizedBox(height: 16),
+                    TextButton.icon(
+                      onPressed: consultando
+                          ? null
+                          : () async {
+                              setSheetState(() {
+                                consultando = true;
+                                estadoConsulta = null;
+                              });
+                              await _cargarHorario();
+                              if (!context.mounted) return;
+                              if (_horarioHoy != null &&
+                                  !_horarioManualActivo) {
+                                Navigator.pop(context);
+                                return;
+                              }
+                              setSheetState(() {
+                                consultando = false;
+                                estadoConsulta = _horarioConfirmado
+                                    ? 'No hay un horario asignado para hoy.'
+                                    : 'No se pudo consultar. Revisa la conexión y reintenta.';
+                              });
+                            },
+                      icon: const Icon(Icons.refresh),
+                      label: Text(
+                        consultando
+                            ? 'Consultando…'
+                            : 'Volver a consultar horario',
+                      ),
+                    ),
+                    if (estadoConsulta != null)
+                      Text(estadoConsulta!, textAlign: TextAlign.center),
+                    const SizedBox(height: 8),
                     _JornadaOption(
                       title: 'Full time',
                       subtitle: '4 marcaciones: entrada, receso y salida',
@@ -1256,7 +1365,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     ),
                     const SizedBox(height: 18),
                     ElevatedButton(
-                      onPressed: seleccion == null
+                      onPressed:
+                          seleccion == null ||
+                              consultando ||
+                              !_horarioConfirmado
                           ? null
                           : () async {
                               final confirmado =
@@ -2317,6 +2429,37 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ],
           ),
           const SizedBox(height: 14),
+          if (_cargandoHorario || !_horarioConfirmado) ...[
+            Row(
+              children: [
+                if (_cargandoHorario)
+                  const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                else
+                  const Icon(Icons.cloud_off_outlined, size: 20),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _cargandoHorario
+                        ? 'Cargando horario…'
+                        : _horarioHoy != null
+                        ? 'Horario guardado del día. No se pudo confirmar con el servidor.'
+                        : 'No se pudo cargar tu horario. Esto no significa que no tengas uno.',
+                    style: TextStyle(color: scheme.onSurface, fontSize: 12),
+                  ),
+                ),
+                if (!_cargandoHorario)
+                  TextButton(
+                    onPressed: _reintentarHorario,
+                    child: const Text('Reintentar'),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+          ],
           if (_horarioManualActivo) ...[
             Container(
               width: double.infinity,

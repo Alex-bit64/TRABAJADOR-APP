@@ -1597,6 +1597,7 @@ class SupabaseService {
   Future<Map<String, dynamic>?> obtenerHorarioTrabajador(
     String dni, {
     String? diaSemana,
+    bool propagarError = false,
   }) async {
     try {
       AppLogger.info('SupabaseService', 'Consultando horario trabajador', {
@@ -1607,7 +1608,10 @@ class SupabaseService {
       try {
         final response = await _db.rpc(
           'obtener_horario_trabajador',
-          params: {'p_dni': dni, 'p_dia_semana': diaSemana},
+          params: {
+            'p_dni': dni.trim(),
+            'p_dia_semana': diaSemana?.trim().toLowerCase(),
+          },
         );
 
         final horariosRpc = _normalizarHorarios(response, diaSemana);
@@ -1625,10 +1629,7 @@ class SupabaseService {
         });
         return horariosRpc;
       } on PostgrestException catch (e) {
-        final rpcNoExiste =
-            e.code == 'PGRST202' ||
-            e.code == '42883' ||
-            e.message.contains('obtener_horario_trabajador');
+        final rpcNoExiste = e.code == 'PGRST202' || e.code == '42883';
         if (!rpcNoExiste) {
           rethrow;
         }
@@ -1643,10 +1644,10 @@ class SupabaseService {
       var query = _db
           .from('horario_trabajador')
           .select()
-          .eq('dni_trabajador', dni);
+          .eq('dni_trabajador', dni.trim());
 
       if (diaSemana != null && diaSemana.isNotEmpty) {
-        query = query.eq('dia_semana', diaSemana);
+        query = query.eq('dia_semana', diaSemana.trim().toLowerCase());
       }
 
       final response = await query;
@@ -1674,6 +1675,9 @@ class SupabaseService {
         'dni': AppLogger.shortId(dni),
         'dia': diaSemana ?? 'todos',
       });
+      if (propagarError) {
+        rethrow;
+      }
       return null;
     }
   }
@@ -2874,7 +2878,10 @@ class SupabaseService {
     Object? response,
     String? diaSemana,
   ) {
-    if (response is! List || response.isEmpty) {
+    if (response is! List) {
+      throw const FormatException('Respuesta de horarios inesperada');
+    }
+    if (response.isEmpty) {
       return null;
     }
 

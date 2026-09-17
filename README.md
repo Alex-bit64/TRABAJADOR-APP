@@ -62,6 +62,21 @@ Apple Developer, un identificador definitivo de la app y firma válida.
 - Para cambiar el botón de modo oscuro/claro, ajusta `lib/screens/login_screen.dart`.
 - Para modificar colores o tipografías, revisa `lib/theme/app_theme.dart`.
 - Si quieres adaptar el backend, revisa `supabase_horario_rpc.sql`, `supabase_login_rpc.sql` y `supabase_qr_asistencia_rpc.sql`.
+- El logo original está en `assets/app_icon_source.jpeg`. En Windows,
+  `./scripts/update_app_icons.ps1` regenera los iconos Android/iOS y los logos
+  de las pantallas sin cambiar identificadores ni firma de instalación.
+
+## Cambios de la versión 1.2.1
+
+- La carga del horario distingue ausencia confirmada de errores de conexión.
+  Muestra primero el horario guardado del día, reintenta la consulta y permite
+  volver a consultar sin elegir una jornada manual por un fallo de red.
+- El modo claro/oscuro se conserva entre aperturas y cierres de sesión.
+- Nuevo icono basado en `ColorMarcosGrandes.jpeg`.
+- Android consulta `obtener_version_trabajador_app` al abrir la aplicación.
+  La versión publicada se activa solo después de verificar su APK descargable.
+  Equipos anteriores al sistema de actualización necesitan una instalación
+  manual inicial; la app no puede instalar un APK remotamente.
 
 ## Notas
 
