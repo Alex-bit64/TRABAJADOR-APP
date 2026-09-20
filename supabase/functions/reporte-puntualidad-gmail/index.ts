@@ -2,6 +2,13 @@ import "@supabase/functions-js/edge-runtime.d.ts";
 
 import { createClient } from "@supabase/supabase-js";
 import nodemailer from "nodemailer";
+import {
+  claveCoordenadas,
+  direccionGeocodificada,
+  direccionMarca,
+  obtenerCoordenadas,
+  type Coordenadas,
+} from "./tracking_address.ts";
 
 type ReporteTipo = "TIENDA" | "GENERAL";
 
@@ -64,6 +71,7 @@ type TrackingMarca = {
   hora_marca: string;
   ubicacion: Record<string, unknown> | null;
   tipo: "NORMAL" | "MULTIPLE" | string;
+  direccion_marca?: string;
 };
 
 type TrackingDetalle = {
@@ -121,6 +129,8 @@ const smtpHost = Deno.env.get("GMAIL_SMTP_HOST") ?? "smtp.gmail.com";
 const smtpPort = Number(Deno.env.get("GMAIL_SMTP_PORT") ?? "465");
 const smtpSecure = (Deno.env.get("GMAIL_SMTP_SECURE") ?? "true") !== "false";
 const cronSecret = requiredEnv("CRON_SECRET").trim();
+const geocodeReverseUrl = Deno.env.get("GEOCODING_REVERSE_URL") ??
+  "https://nominatim.openstreetmap.org/reverse";
 
 const supabase = createClient(supabaseUrl, serviceRoleKey, {
   auth: { persistSession: false },
@@ -532,8 +542,8 @@ function construirTracking(
         dni_trabajador: dni,
         nombre_trabajador: trabajador?.nombre?.trim() || "Sin nombre",
         lugar: tiendaVisitada?.nombre ?? "Ubicacion no identificada",
-        direccion: tiendaVisitada?.direccion?.trim() ||
-          "Direccion no registrada",
+        // The store address is not the GPS position of this individual mark.
+        direccion: direccionMarca(coordenadas, marca.direccion_marca),
         evento,
         hora: horaLima(marca.hora_marca),
         enlace_mapa: coordenadas
@@ -577,17 +587,6 @@ function eventoTracking(
     : "Salida (segun orden de marcas)";
 }
 
-function obtenerCoordenadas(ubicacion: Record<string, unknown> | null) {
-  if (!ubicacion) {
-    return null;
-  }
-  const latitud = Number(ubicacion.latitud ?? ubicacion.latitude);
-  const longitud = Number(ubicacion.longitud ?? ubicacion.longitude);
-  return Number.isFinite(latitud) && Number.isFinite(longitud)
-    ? { latitud, longitud }
-    : null;
-}
-
 async function cargarContextoReporte(
   fecha: string,
   incluirTracking: boolean,
@@ -620,6 +619,10 @@ async function cargarContextoReporte(
     obtenerTiendas(tiendasIds, true),
     incluirTracking ? obtenerTracking(dnis, fecha) : Promise.resolve([]),
   ]);
+  if (incluirTracking) {
+    // Address lookup is best-effort: it must never prevent attendance emails.
+    await enriquecerDireccionesTracking(tracking);
+  }
 
   return {
     trabajadores,
@@ -814,6 +817,99 @@ async function obtenerTracking(dnis: string[], fecha: string) {
   return (data ?? []) as TrackingMarca[];
 }
 
+async function enriquecerDireccionesTracking(marcas: TrackingMarca[]) {
+  const coordenadasPorClave = new Map<string, Coordenadas>();
+  for (const marca of marcas) {
+    const coordenadas = obtenerCoordenadas(marca.ubicacion);
+    if (coordenadas) {
+      coordenadasPorClave.set(claveCoordenadas(coordenadas), coordenadas);
+    }
+  }
+  if (coordenadasPorClave.size === 0) return;
+
+  const direcciones = new Map<string, string>();
+  try {
+    const claves = [...coordenadasPorClave.keys()];
+    // Keep PostgREST URLs small even when many stores/workers are reported.
+    for (let i = 0; i < claves.length; i += 100) {
+      const { data, error } = await supabase
+        .from("tracking_geocode_cache")
+        .select("clave,direccion")
+        .in("clave", claves.slice(i, i + 100));
+      if (error) throw error;
+      for (const item of data ?? []) {
+        direcciones.set(item.clave, item.direccion);
+      }
+    }
+
+    // No more than two new lookups in one report. A database reservation also
+    // enforces a global 15-second gap across overlapping cron invocations.
+    let consultas = 0;
+    for (const [clave, coordenadas] of coordenadasPorClave) {
+      if (direcciones.has(clave)) continue;
+      if (consultas >= 2) break;
+      const { data: turno, error } = await supabase.rpc(
+        "reservar_tracking_geocode_slot",
+      );
+      if (error) throw error;
+      if (!turno) break;
+      consultas++;
+      const espera = Math.max(0, new Date(turno).getTime() - Date.now());
+      if (espera > 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, espera));
+      }
+      try {
+        const direccion = await consultarDireccionGPS(coordenadas);
+        if (!direccion) continue;
+        direcciones.set(clave, direccion);
+        const { error: cacheError } = await supabase
+          .from("tracking_geocode_cache")
+          .upsert({
+            clave,
+            direccion,
+            fuente: "OpenStreetMap/Nominatim",
+            actualizado_en: new Date().toISOString(),
+          });
+        if (cacheError) {
+          console.warn("No se pudo guardar direccion de tracking", cacheError);
+        }
+      } catch (error) {
+        console.warn("Geocodificacion de tracking no disponible", error);
+      }
+    }
+  } catch (error) {
+    console.warn("Cache de direcciones de tracking no disponible", error);
+  }
+
+  for (const marca of marcas) {
+    const coordenadas = obtenerCoordenadas(marca.ubicacion);
+    if (coordenadas) {
+      marca.direccion_marca = direcciones.get(claveCoordenadas(coordenadas));
+    }
+  }
+}
+
+async function consultarDireccionGPS(coordenadas: Coordenadas) {
+  const url = new URL(geocodeReverseUrl);
+  url.searchParams.set("format", "jsonv2");
+  url.searchParams.set("addressdetails", "1");
+  url.searchParams.set("zoom", "18");
+  url.searchParams.set("lat", String(coordenadas.latitud));
+  url.searchParams.set("lon", String(coordenadas.longitud));
+  const respuesta = await fetch(url, {
+    headers: {
+      "User-Agent":
+        "TRABAJADOR-APP-reportes/1.0 (https://github.com/Alex-bit64/TRABAJADOR-APP)",
+    },
+    signal: AbortSignal.timeout(4000),
+  });
+  if (!respuesta.ok) {
+    throw new Error(`Geocodificacion HTTP ${respuesta.status}`);
+  }
+  const direccion = direccionGeocodificada(await respuesta.json());
+  return direccion ? `${direccion} (aprox.)` : null;
+}
+
 function agruparTracking(items: TrackingMarca[]) {
   const resultado = new Map<string, TrackingMarca[]>();
   for (const item of items) {
@@ -954,7 +1050,7 @@ function renderHtml(params: {
       ${contenido}
       ${
     incluirTracking
-      ? `<p style="font-size:12px;color:#718096;margin:22px 0 0;">Las marcas de tracking libre no guardan un tipo explicito. “Llegada/Salida” se presenta segun el orden cronologico de las marcas realizadas por trabajador y lugar.</p>`
+      ? `<p style="font-size:12px;color:#718096;margin:22px 0 0;">Las marcas de tracking libre no guardan un tipo explicito. “Llegada/Salida” se presenta segun el orden cronologico de las marcas realizadas por trabajador y lugar. Las direcciones son aproximadas (datos de <a href="https://www.openstreetmap.org/copyright">© OpenStreetMap contributors</a>); el enlace del mapa conserva las coordenadas exactas de cada marca.</p>`
       : ""
   }
     </div>
@@ -1062,7 +1158,7 @@ function trackingHtml(items: TrackingDetalle[]) {
         <th style="${thStyle}">Lugar visitado</th>
         <th style="${thStyle}">Movimiento</th>
         <th style="${thStyle}">Hora</th>
-        <th style="${thStyle}">Direccion</th>
+        <th style="${thStyle}">Ubicacion de la marca</th>
         <th style="${thStyle}">Mapa</th>
       </tr></thead>
       <tbody>${filas}</tbody>
@@ -1089,7 +1185,7 @@ function tarjetaTrackingHtml(item: TrackingDetalle) {
     ${filaDatoMovil("Lugar visitado", item.lugar)}
     ${filaDatoMovil("Movimiento", item.evento)}
     ${filaDatoMovil("Hora", item.hora)}
-    ${filaDatoMovil("Direccion", item.direccion)}
+    ${filaDatoMovil("Ubicacion de la marca", item.direccion)}
     ${filaDatoMovil("Mapa", mapa, true, true)}
   </table>`;
 }
@@ -1150,6 +1246,11 @@ function renderTexto(params: {
       );
     }
     lineas.push("");
+  }
+  if (incluirTracking) {
+    lineas.push(
+      "Direcciones aproximadas: © OpenStreetMap contributors (https://www.openstreetmap.org/copyright). El enlace del mapa usa las coordenadas exactas de la marca.",
+    );
   }
   return lineas.join("\n");
 }

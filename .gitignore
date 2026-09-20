@@ -32,6 +32,7 @@ migrate_working_dir/
 .pub/
 /build/
 /coverage/
+**/node_modules/
 
 # Generated platform configuration
 /ios/Flutter/Generated.xcconfig
